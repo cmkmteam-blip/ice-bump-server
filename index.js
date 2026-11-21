@@ -41,9 +41,9 @@ const ARENAS = {
 };
 
 const BOT_DIFFS = {
-  easy: { speedMult: 0.54, pushBase: 5.5, regenMult: 0.42, dashChance: 0.004, teeterDelay: 1.45, graceSec: 4.0 },
-  medium: { speedMult: 0.66, pushBase: 6.8, regenMult: 0.52, dashChance: 0.008, teeterDelay: 1.15, graceSec: 3.2 },
-  hard: { speedMult: 0.78, pushBase: 8.2, regenMult: 0.65, dashChance: 0.014, teeterDelay: 0.85, graceSec: 2.2 },
+  easy: { speedMult: 0.45, pushBase: 3.2, regenMult: 0.32, dashChance: 0.002, teeterDelay: 1.9, graceSec: 5.0 },
+  medium: { speedMult: 0.62, pushBase: 5.2, regenMult: 0.48, dashChance: 0.006, teeterDelay: 1.35, graceSec: 3.5 },
+  hard: { speedMult: 0.78, pushBase: 7.5, regenMult: 0.65, dashChance: 0.014, teeterDelay: 0.85, graceSec: 2.0 },
 };
 
 function levelBonus(level, fairMode) {
@@ -185,7 +185,7 @@ class Room {
         stamina: 100, idleFullTimer: 0, superCharged: false, dashTimer: 0, dashCooldown: 0, dashDirX: 0, dashDirZ: 1,
         mounted: true, alive: true, falling: false,
         teetering: false, teeterTimer: 0, teeterTaps: 0, teeterEdgeAngle: 0,
-        carryingBombId: null, sizeScale: 1, sizeTimer: 0, stunTimer: 0, invulnTimer: 0,
+        carryingBombId: null, sizeScale: 1, sizeTimer: 0, stunTimer: 0, knockbackTimer: 0, invulnTimer: 0,
         hasLightning: false, lightningTimer: 0, hasWeight: false, weightTimer: 0,
         tauntText: null, tauntTimer: 0, wins: 0, kos: 0,
       });
@@ -229,7 +229,7 @@ class Room {
       p.mounted = true; p.alive = true; p.falling = false;
       p.teetering = false; p.teeterTimer = 0; p.teeterTaps = 0;
       p.carryingBombId = null; p.sizeScale = 1; p.sizeTimer = 0;
-      p.stunTimer = 0; p.invulnTimer = 0;
+      p.stunTimer = 0; p.knockbackTimer = 0; p.invulnTimer = 0;
       p.hasLightning = false; p.lightningTimer = 0;
       p.hasWeight = false; p.weightTimer = 0;
       p.tauntText = null; p.tauntTimer = 0;
@@ -356,6 +356,7 @@ class Room {
 
     if (p.invulnTimer > 0) p.invulnTimer = Math.max(0, p.invulnTimer - dt);
     if (p.dashCooldown > 0) p.dashCooldown = Math.max(0, p.dashCooldown - dt);
+    if (p.knockbackTimer > 0) p.knockbackTimer = Math.max(0, p.knockbackTimer - dt);
     if (p.sizeTimer > 0) { p.sizeTimer -= dt; if (p.sizeTimer <= 0) p.sizeScale = 1.0; }
 
     if (p.hasLightning) {
@@ -427,16 +428,22 @@ class Room {
     const cost = p.mounted ? spec.dashCost : 45;
     if (input.dashPressed && p.dashTimer <= 0 && p.dashCooldown <= 0 && p.stamina >= cost - 2) {
       p.stamina = Math.max(0, p.stamina - cost);
-      p.dashTimer = spec.dashDuration; p.dashCooldown = 0.16;
+      p.idleFullTimer = 0;
+      p.dashTimer = p.isBot ? spec.dashDuration : spec.dashDuration + 0.14;
+      p.dashCooldown = 0.14;
       p.dashDirX = mag > 0.12 ? dirX : Math.sin(p.angle);
       p.dashDirZ = mag > 0.12 ? dirZ : Math.cos(p.angle);
-      const sm = p.mounted ? 1 : 0.6;
+      const sm = (p.mounted ? 1 : 0.6) * (p.superCharged ? 1.22 : 1);
       p.vx = p.dashDirX * spec.dashSpeed * sm;
       p.vz = p.dashDirZ * spec.dashSpeed * sm;
     }
 
-    if (p.dashTimer > 0) {
+    if (p.knockbackTimer > 0) {
+      const kbDrag = Math.exp(-0.55 * dt);
+      p.vx *= kbDrag; p.vz *= kbDrag;
+    } else if (p.dashTimer > 0) {
       p.dashTimer -= dt;
+      if (p.dashTimer <= 0) p.superCharged = false;
     } else {
       const maxSpeed = spec.moveSpeed * (p.mounted ? 1 : 0.8) * (p.hasWeight ? 0.88 : 1) * (p.isBot ? diff.speedMult : 1.04 * bonus.speedMult);
       p.vx += dirX * mag * ICE_ACCEL * dt; p.vz += dirZ * mag * ICE_ACCEL * dt;
@@ -479,14 +486,18 @@ class Room {
       for (let j = i + 1; j < this.players.length; j++) {
         const b = this.players[j];
         if (!b.alive) continue;
-        const minDist = 0.62 * (a.sizeScale + b.sizeScale);
+        const aD = a.dashTimer > 0, bD = b.dashTimer > 0;
+        const humanReach = (!a.isBot && aD) || (!b.isBot && bD) ? 1.95 : 0;
+        const minDist = Math.max(0.62 * (a.sizeScale + b.sizeScale), humanReach);
         const dx = b.x - a.x, dz = b.z - a.z;
         const dist = Math.hypot(dx, dz);
         if (dist >= minDist || dist < 0.0001) continue;
         const nx = dx / dist, nz = dz / dist;
-        const overlap = minDist - dist;
-        a.x -= nx * overlap * 0.5; a.z -= nz * overlap * 0.5;
-        b.x += nx * overlap * 0.5; b.z += nz * overlap * 0.5;
+        const overlap = 0.62 * (a.sizeScale + b.sizeScale) - dist;
+        if (overlap > 0) {
+          a.x -= nx * overlap * 0.5; a.z -= nz * overlap * 0.5;
+          b.x += nx * overlap * 0.5; b.z += nz * overlap * 0.5;
+        }
 
         const sA = CHAR_SPECS[a.charId], sB = CHAR_SPECS[b.charId];
         const bA = levelBonus(a.level, this.fairMode).pushMult;
@@ -494,19 +505,25 @@ class Room {
         const mA = sA.mass * (a.sizeScale > 1.2 ? 1.6 : 1);
         const mB = sB.mass * (b.sizeScale > 1.2 ? 1.6 : 1);
 
-        const botVuln = this.difficulty === 'easy' ? 1.5 : this.difficulty === 'medium' ? 1.25 : 1.08;
-        if (a.dashTimer > 0 && b.dashTimer <= 0 && b.invulnTimer <= 0) {
+        const botVuln = this.difficulty === 'easy' ? 1.65 : this.difficulty === 'medium' ? 1.3 : 1.1;
+        const aWins = aD && (!bD || (!a.isBot && b.isBot));
+        const bWins = bD && (!aD || (!b.isBot && a.isBot));
+        if (aWins && b.invulnTimer <= 0) {
           const sm = a.superCharged ? 2.0 : 1.0;
-          const f = ((a.isBot ? (frenzy ? 23.0 : diff.pushBase) : 18.2 * bA * (b.isBot ? botVuln : 1)) * sm * sA.pushForce) / mB;
-          b.vx = nx * f; b.vz = nz * f; b.invulnTimer = frenzy ? 0.2 : 0.45;
+          const f = ((a.isBot ? (frenzy ? 24.0 : diff.pushBase) : 16.5 * bA * (b.isBot ? botVuln : 1)) * sm * sA.pushForce) / mB;
+          b.vx = nx * f; b.vz = nz * f;
+          b.knockbackTimer = b.isBot ? (this.difficulty === 'easy' ? 0.85 : 0.65) : 0.16;
+          b.invulnTimer = frenzy ? 0.2 : 0.4;
           if (!a.isBot || frenzy) b.teetering = false;
-          a.vx *= 0.35; a.vz *= 0.35; a.dashTimer = 0; a.superCharged = false;
-        } else if (b.dashTimer > 0 && a.dashTimer <= 0 && a.invulnTimer <= 0) {
+          a.vx *= 0.25; a.vz *= 0.25; a.dashTimer = 0; a.superCharged = false;
+        } else if (bWins && a.invulnTimer <= 0) {
           const sm = b.superCharged ? 2.0 : 1.0;
-          const f = ((b.isBot ? (frenzy ? 23.0 : diff.pushBase) : 18.2 * bB * (a.isBot ? botVuln : 1)) * sm * sB.pushForce) / mA;
-          a.vx = -nx * f; a.vz = -nz * f; a.invulnTimer = frenzy ? 0.2 : 0.45;
+          const f = ((b.isBot ? (frenzy ? 24.0 : diff.pushBase) : 16.5 * bB * (a.isBot ? botVuln : 1)) * sm * sB.pushForce) / mA;
+          a.vx = -nx * f; a.vz = -nz * f;
+          a.knockbackTimer = a.isBot ? (this.difficulty === 'easy' ? 0.85 : 0.65) : 0.16;
+          a.invulnTimer = frenzy ? 0.2 : 0.4;
           if (!b.isBot || frenzy) a.teetering = false;
-          b.vx *= 0.35; b.vz *= 0.35; b.dashTimer = 0; b.superCharged = false;
+          b.vx *= 0.25; b.vz *= 0.25; b.dashTimer = 0; b.superCharged = false;
         } else {
           const sep = (b.vx - a.vx) * nx + (b.vz - a.vz) * nz;
           if (sep < 0) {
