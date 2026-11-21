@@ -29,7 +29,7 @@ const CHAR_SPECS = {
   zappy: { dashCost: 58, dashSpeed: 15.0, dashDuration: 0.25, pushForce: 1.12, mass: 0.96, moveSpeed: 6.5 },
 };
 const CHAR_LIST = ['foxy', 'beep', 'bambu', 'zappy'];
-const BOT_NAMES = ['Frosty', 'ChillBot', 'Yeti99', 'Pingu', 'IceKing', 'Slushie'];
+const BOT_NAMES = ['Shawarma', 'Falafel', 'Knafeh', 'Zaatar', 'Bataata', 'Felfel', 'Hummus', 'Labneh'];
 const SPAWN_ANGLES = [Math.PI * 0.25, Math.PI * 0.75, Math.PI * 1.25, Math.PI * 1.75];
 const BIOME_LIST = ['snow', 'desert', 'grass'];
 
@@ -41,10 +41,9 @@ const ARENAS = {
 };
 
 const BOT_DIFFS = {
-  easy: { speedMult: 0.72, pushBase: 7.4, regenMult: 0.55, dashChance: 0.009, teeterDelay: 1.05, graceSec: 3.2 },
-  medium: { speedMult: 0.84, pushBase: 8.8, regenMult: 0.7, dashChance: 0.016, teeterDelay: 0.72, graceSec: 2.2 },
-  hard: { speedMult: 0.96, pushBase: 10.4, regenMult: 0.88, dashChance: 0.028, teeterDelay: 0.45, graceSec: 1.2 },
-  very_hard: { speedMult: 1.06, pushBase: 11.8, regenMult: 1.05, dashChance: 0.045, teeterDelay: 0.28, graceSec: 0.5 },
+  easy: { speedMult: 0.54, pushBase: 5.5, regenMult: 0.42, dashChance: 0.004, teeterDelay: 1.45, graceSec: 4.0 },
+  medium: { speedMult: 0.66, pushBase: 6.8, regenMult: 0.52, dashChance: 0.008, teeterDelay: 1.15, graceSec: 3.2 },
+  hard: { speedMult: 0.78, pushBase: 8.2, regenMult: 0.65, dashChance: 0.014, teeterDelay: 0.85, graceSec: 2.2 },
 };
 
 function levelBonus(level, fairMode) {
@@ -183,7 +182,7 @@ class Room {
         isLocal: false,
         goldenMount: c ? c.goldenMount : false,
         x: 0, y: 0, z: 0, vx: 0, vz: 0, vy: 0, angle: 0,
-        stamina: 100, dashTimer: 0, dashCooldown: 0, dashDirX: 0, dashDirZ: 1,
+        stamina: 100, idleFullTimer: 0, superCharged: false, dashTimer: 0, dashCooldown: 0, dashDirX: 0, dashDirZ: 1,
         mounted: true, alive: true, falling: false,
         teetering: false, teeterTimer: 0, teeterTaps: 0, teeterEdgeAngle: 0,
         carryingBombId: null, sizeScale: 1, sizeTimer: 0, stunTimer: 0, invulnTimer: 0,
@@ -226,7 +225,7 @@ class Room {
       p.x = Math.cos(a) * spawnDist; p.z = Math.sin(a) * spawnDist;
       p.y = 0; p.vx = 0; p.vz = 0; p.vy = 0;
       p.angle = Math.atan2(-p.x, -p.z);
-      p.stamina = 100; p.dashTimer = 0; p.dashCooldown = 0;
+      p.stamina = 100; p.idleFullTimer = 0; p.superCharged = false; p.dashTimer = 0; p.dashCooldown = 0;
       p.mounted = true; p.alive = true; p.falling = false;
       p.teetering = false; p.teeterTimer = 0; p.teeterTaps = 0;
       p.carryingBombId = null; p.sizeScale = 1; p.sizeTimer = 0;
@@ -342,9 +341,15 @@ class Room {
     this.broadcastSnapshot();
   }
 
+  onlyBotsAlive() {
+    const alive = this.players.filter((p) => p.alive);
+    return alive.length > 1 && alive.every((p) => p.isBot);
+  }
+
   stepPlayer(p, input, dt) {
     const spec = CHAR_SPECS[p.charId];
-    const diff = BOT_DIFFS[this.difficulty];
+    const diff = BOT_DIFFS[this.difficulty] || BOT_DIFFS.medium;
+    const frenzy = p.isBot && this.onlyBotsAlive();
     const bonus = levelBonus(p.level, this.fairMode);
 
     if (p.invulnTimer > 0) p.invulnTimer = Math.max(0, p.invulnTimer - dt);
@@ -362,7 +367,15 @@ class Room {
       p.weightTimer -= dt;
       if (p.weightTimer <= 0) { p.hasWeight = false; this.eliminate(p, 0, 0); return; }
     }
-    if (p.dashTimer <= 0) p.stamina = Math.min(100, p.stamina + STAMINA_REGEN * (p.isBot ? diff.regenMult : 1.05 * bonus.regenMult) * dt);
+    if (p.dashTimer <= 0) {
+      p.stamina = Math.min(100, p.stamina + STAMINA_REGEN * (p.isBot ? (frenzy ? 1.8 : diff.regenMult) : 1.05 * bonus.regenMult) * dt);
+      if (p.stamina >= 99 && !p.teetering && p.stunTimer <= 0) {
+        p.idleFullTimer = (p.idleFullTimer || 0) + dt;
+        if (p.idleFullTimer >= 3.5) p.superCharged = true;
+      } else {
+        p.idleFullTimer = 0;
+      }
+    }
 
     if (this.tiltX !== 0 || this.tiltZ !== 0) {
       p.vx += -this.tiltZ * 26 * dt;
@@ -457,6 +470,7 @@ class Room {
 
   resolveCollisions() {
     const diff = BOT_DIFFS[this.difficulty];
+    const frenzy = this.onlyBotsAlive();
     for (let i = 0; i < this.players.length; i++) {
       const a = this.players[i];
       if (!a.alive) continue;
@@ -479,15 +493,17 @@ class Room {
         const mB = sB.mass * (b.sizeScale > 1.2 ? 1.6 : 1);
 
         if (a.dashTimer > 0 && b.dashTimer <= 0 && b.invulnTimer <= 0) {
-          const f = ((a.isBot ? diff.pushBase : 11.4 * bA) * sA.pushForce) / mB;
-          b.vx = nx * f; b.vz = nz * f; b.invulnTimer = 0.55;
-          if (!a.isBot) b.teetering = false;
-          a.vx *= 0.35; a.vz *= 0.35; a.dashTimer = 0;
+          const sm = a.superCharged ? 2.0 : 1.0;
+          const f = ((a.isBot ? (frenzy ? 16.5 : diff.pushBase) : 14.5 * bA) * sm * sA.pushForce) / mB;
+          b.vx = nx * f; b.vz = nz * f; b.invulnTimer = 0.5;
+          if (!a.isBot || frenzy) b.teetering = false;
+          a.vx *= 0.35; a.vz *= 0.35; a.dashTimer = 0; a.superCharged = false;
         } else if (b.dashTimer > 0 && a.dashTimer <= 0 && a.invulnTimer <= 0) {
-          const f = ((b.isBot ? diff.pushBase : 11.4 * bB) * sB.pushForce) / mA;
-          a.vx = -nx * f; a.vz = -nz * f; a.invulnTimer = 0.55;
-          if (!b.isBot) a.teetering = false;
-          b.vx *= 0.35; b.vz *= 0.35; b.dashTimer = 0;
+          const sm = b.superCharged ? 2.0 : 1.0;
+          const f = ((b.isBot ? (frenzy ? 16.5 : diff.pushBase) : 14.5 * bB) * sm * sB.pushForce) / mA;
+          a.vx = -nx * f; a.vz = -nz * f; a.invulnTimer = 0.5;
+          if (!b.isBot || frenzy) a.teetering = false;
+          b.vx *= 0.35; b.vz *= 0.35; b.dashTimer = 0; b.superCharged = false;
         } else {
           const sep = (b.vx - a.vx) * nx + (b.vz - a.vz) * nz;
           if (sep < 0) {
@@ -619,9 +635,11 @@ class Room {
   }
 
   botInput(bot, dt) {
-    const diff = BOT_DIFFS[this.difficulty];
+    const diff = BOT_DIFFS[this.difficulty] || BOT_DIFFS.medium;
+    const frenzy = this.onlyBotsAlive();
     const out = { moveX: 0, moveZ: 0, dashPressed: false, bombPressed: false, taunt: null };
     if (bot.teetering) {
+      if (frenzy) return out;
       this.botTimers[bot.slot] -= dt;
       if (this.botTimers[bot.slot] <= 0) { out.dashPressed = true; this.botTimers[bot.slot] = diff.teeterDelay; }
       return out;
@@ -635,7 +653,7 @@ class Room {
     const d = Math.max(0.01, Math.hypot(t.x - bot.x, t.z - bot.z));
     out.moveX = (t.x - bot.x) / d; out.moveZ = (t.z - bot.z) / d;
     if (bot.carryingBombId && d < 6 && Math.random() < 0.08) out.bombPressed = true;
-    else if (ROUND_DURATION - this.roundTimer > diff.graceSec && d < 2.6 && bot.stamina >= CHAR_SPECS[bot.charId].dashCost && Math.random() < diff.dashChance) out.dashPressed = true;
+    else if ((frenzy || ROUND_DURATION - this.roundTimer > diff.graceSec) && d < (frenzy ? 3.8 : 2.6) && bot.stamina >= CHAR_SPECS[bot.charId].dashCost && Math.random() < (frenzy ? 0.16 : diff.dashChance)) out.dashPressed = true;
     return out;
   }
 
