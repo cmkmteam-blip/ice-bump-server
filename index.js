@@ -24,7 +24,7 @@ const BOMB_THROW_SPEED = 13.8;
 
 const CHAR_SPECS = {
   foxy: { dashCost: 50, dashSpeed: 14.2, dashDuration: 0.24, pushForce: 1.0, mass: 1.0, moveSpeed: 6.2 },
-  beep: { dashCost: 100, dashSpeed: 15.4, dashDuration: 0.24, pushForce: 1.48, mass: 0.92, moveSpeed: 5.9 },
+  beep: { dashCost: 72, dashSpeed: 16.2, dashDuration: 0.25, pushForce: 1.55, mass: 0.94, moveSpeed: 6.1 },
   bambu: { dashCost: 72, dashSpeed: 15.6, dashDuration: 0.27, pushForce: 1.32, mass: 1.35, moveSpeed: 5.5 },
   zappy: { dashCost: 58, dashSpeed: 15.0, dashDuration: 0.25, pushForce: 1.12, mass: 0.96, moveSpeed: 6.5 },
 };
@@ -735,7 +735,7 @@ const httpServer = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'ok', version: '2.0', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
+  res.end(JSON.stringify({ status: 'ok', version: '2.7', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
 });
 
 const wss = new WebSocketServer({ server: httpServer });
