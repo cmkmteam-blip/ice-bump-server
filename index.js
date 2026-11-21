@@ -2,11 +2,11 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 
 /**
- * Ice Bump: Push Party Online — Authoritative 4-Player WebSocket Server
- * Supports:
- *  - Global Quick Match (joins open room, auto-fills smart AI bots after 6 seconds!)
- *  - Private 4-Letter Friend Rooms (create / join by code, host starts anytime with bots)
- *  - Full 20Hz authoritative physics, bombs, lightning, weight, grow/shrink, edge teetering!
+ * Ice Bump: Push Party Online v2.0 — Authoritative Global Multiplayer & Leaderboard Server
+ * - Global Ranked Quick Match (level-bracketed ±6 levels + smart bot fill!)
+ * - Private 4-Letter Friend Rooms (Fair Mode: equalized level for all friends!)
+ * - Biomes (Snow / Desert / Grass), Tilt Arena, Meltdown, Special Bombs (Frost / Mega / Homing)
+ * - Global & Country Leaderboard REST API (/leaderboard, /score)
  */
 
 const PORT = Number(process.env.PORT || 8080);
@@ -19,8 +19,8 @@ const ICE_FRICTION = 2.65;
 const TEETER_DURATION = 2.1;
 const TEETER_TAPS_REQUIRED = 2;
 const INSTANT_KO_SPEED = 14.5;
-const BOMB_RADIUS = 2.1;
-const BOMB_THROW_SPEED = 13.5;
+const BOMB_RADIUS = 2.15;
+const BOMB_THROW_SPEED = 13.8;
 
 const CHAR_SPECS = {
   foxy: { dashCost: 50, dashSpeed: 14.2, dashDuration: 0.24, pushForce: 1.0, mass: 1.0, moveSpeed: 6.2 },
@@ -31,12 +31,40 @@ const CHAR_SPECS = {
 const CHAR_LIST = ['foxy', 'beep', 'bambu', 'zappy'];
 const BOT_NAMES = ['Frosty', 'ChillBot', 'Yeti99', 'Pingu', 'IceKing', 'Slushie'];
 const SPAWN_ANGLES = [Math.PI * 0.25, Math.PI * 0.75, Math.PI * 1.25, Math.PI * 1.75];
+const BIOME_LIST = ['snow', 'desert', 'grass'];
 
 const ARENAS = {
-  chaos: { baseRadius: 8.2, hasEdgeLip: false, shrinks: false, hasBombs: true },
-  classic: { baseRadius: 8.6, hasEdgeLip: true, shrinks: false, hasBombs: false },
-  meltdown: { baseRadius: 8.4, hasEdgeLip: false, shrinks: true, hasBombs: true },
+  chaos: { baseRadius: 8.2, hasEdgeLip: false, shrinks: false, tilts: false, hasBombs: true },
+  tilt: { baseRadius: 8.3, hasEdgeLip: false, shrinks: false, tilts: true, hasBombs: true },
+  meltdown: { baseRadius: 8.4, hasEdgeLip: false, shrinks: true, tilts: false, hasBombs: true },
+  classic: { baseRadius: 8.6, hasEdgeLip: true, shrinks: false, tilts: false, hasBombs: false },
 };
+
+const BOT_DIFFS = {
+  easy: { speedMult: 0.72, pushBase: 7.4, regenMult: 0.55, dashChance: 0.009, teeterDelay: 1.05, graceSec: 3.2 },
+  medium: { speedMult: 0.84, pushBase: 8.8, regenMult: 0.7, dashChance: 0.016, teeterDelay: 0.72, graceSec: 2.2 },
+  hard: { speedMult: 0.96, pushBase: 10.4, regenMult: 0.88, dashChance: 0.028, teeterDelay: 0.45, graceSec: 1.2 },
+  very_hard: { speedMult: 1.06, pushBase: 11.8, regenMult: 1.05, dashChance: 0.045, teeterDelay: 0.28, graceSec: 0.5 },
+};
+
+function levelBonus(level, fairMode) {
+  if (fairMode) return { speedMult: 1, pushMult: 1, regenMult: 1 };
+  const l = Math.max(1, Math.min(50, Number(level) || 1)) - 1;
+  return { speedMult: 1 + l * 0.0035, pushMult: 1 + l * 0.005, regenMult: 1 + l * 0.004 };
+}
+
+// Live Global & Country Leaderboard (seeded with fun rivals + real players override/climb!)
+const leaderboardMap = new Map([
+  ['ArcticKing', { name: 'ArcticKing', country: 'SY', level: 18, trophies: 420, charId: 'bambu' }],
+  ['DesertFox', { name: 'DesertFox', country: 'SA', level: 22, trophies: 510, charId: 'foxy' }],
+  ['NileSled', { name: 'NileSled', country: 'EG', level: 15, trophies: 340, charId: 'beep' }],
+  ['AmmanHop', { name: 'AmmanHop', country: 'JO', level: 12, trophies: 260, charId: 'zappy' }],
+  ['CedarBump', { name: 'CedarBump', country: 'LB', level: 14, trophies: 310, charId: 'foxy' }],
+  ['DubaiFrost', { name: 'DubaiFrost', country: 'AE', level: 25, trophies: 620, charId: 'beep' }],
+  ['IstanbulIce', { name: 'IstanbulIce', country: 'TR', level: 19, trophies: 455, charId: 'bambu' }],
+  ['PolarPro', { name: 'PolarPro', country: 'US', level: 28, trophies: 710, charId: 'zappy' }],
+  ['BerlinBump', { name: 'BerlinBump', country: 'DE', level: 16, trophies: 375, charId: 'foxy' }],
+]);
 
 const rooms = new Map();
 
@@ -48,19 +76,24 @@ function makeRoomCode() {
 }
 
 class Room {
-  constructor(code, mode, arenaId, targetWins) {
+  constructor(code, mode, arenaId, biome, difficulty, targetWins, hostLevel) {
     this.code = code;
     this.mode = mode; // 'quick' | 'private'
+    this.fairMode = mode === 'private'; // Friends always play Fair Equal Level!
+    this.bracketLevel = Number(hostLevel) || 1;
     this.arenaId = ARENAS[arenaId] ? arenaId : 'chaos';
+    this.biome = BIOME_LIST.includes(biome) ? biome : BIOME_LIST[Math.floor(Math.random() * BIOME_LIST.length)];
+    this.difficulty = BOT_DIFFS[difficulty] ? difficulty : 'medium';
     this.targetWins = Math.max(2, Math.min(7, Number(targetWins) || 3));
-    this.clients = new Map(); // slot -> { ws, id, name, charId, goldenMount, input }
+    this.clients = new Map();
     this.hostSlot = 0;
     this.started = false;
     this.autoStartTimer = mode === 'quick' ? 6.0 : null;
 
-    // Simulation state
     this.phase = 'lobby';
     this.arenaRadius = ARENAS[this.arenaId].baseRadius;
+    this.tiltX = 0;
+    this.tiltZ = 0;
     this.roundNumber = 1;
     this.roundTimer = ROUND_DURATION;
     this.countdownTimer = 0;
@@ -70,20 +103,16 @@ class Room {
     this.players = [];
     this.bombs = [];
     this.pickups = [];
-    this.bombSpawnTimer = 2.5;
+    this.bombSpawnTimer = 2.2;
     this.itemSpawnTimer = 5.0;
     this.nextId = 1;
     this.botTimers = [0, 0, 0, 0];
-    this.dropper = { x: 0, y: 4.8, z: 0, angle: 0, beamActive: false, beamTimer: 0, beamColor: 0x38bdf8, beamTargetX: 0, beamTargetZ: 0 };
   }
 
   addClient(ws, info) {
     let slot = -1;
     for (let i = 0; i < 4; i++) {
-      if (!this.clients.has(i)) {
-        slot = i;
-        break;
-      }
+      if (!this.clients.has(i)) { slot = i; break; }
     }
     if (slot === -1) return null;
     if (this.clients.size === 0) this.hostSlot = slot;
@@ -94,6 +123,8 @@ class Room {
       id: `p_${Date.now()}_${slot}`,
       name: (info.name || `Player${slot + 1}`).slice(0, 12),
       charId: CHAR_SPECS[info.charId] ? info.charId : CHAR_LIST[slot],
+      level: Math.max(1, Math.min(50, Number(info.level) || 1)),
+      bombType: ['classic', 'frost', 'mega', 'homing'].includes(info.bombType) ? info.bombType : 'classic',
       goldenMount: Boolean(info.goldenMount),
       input: { moveX: 0, moveZ: 0, dashPressed: false, bombPressed: false, taunt: null },
     };
@@ -102,54 +133,32 @@ class Room {
     ws._slot = slot;
 
     this.broadcastLobby();
-    if (this.clients.size === 4 && !this.started) {
-      this.startMatch();
-    }
+    if (this.clients.size === 4 && !this.started) this.startMatch();
     return client;
   }
 
   removeClient(slot) {
     this.clients.delete(slot);
-    if (this.clients.size === 0) {
-      rooms.delete(this.code);
-      return;
-    }
-    if (this.hostSlot === slot) {
-      this.hostSlot = [...this.clients.keys()][0];
-    }
-    if (this.started && this.players[slot]) {
-      this.players[slot].isBot = true; // Seamless bot takeover if someone disconnects!
-    } else {
-      this.broadcastLobby();
-    }
+    if (this.clients.size === 0) { rooms.delete(this.code); return; }
+    if (this.hostSlot === slot) this.hostSlot = [...this.clients.keys()][0];
+    if (this.started && this.players[slot]) this.players[slot].isBot = true;
+    else this.broadcastLobby();
   }
 
   broadcastLobby() {
     const players = [...this.clients.values()].map((c) => ({
-      slot: c.slot,
-      id: c.id,
-      name: c.name,
-      charId: c.charId,
-      isBot: false,
-      isHost: c.slot === this.hostSlot,
+      slot: c.slot, id: c.id, name: c.name, charId: c.charId, level: c.level, isBot: false, isHost: c.slot === this.hostSlot,
     }));
     for (const c of this.clients.values()) {
       if (c.ws.readyState === 1) {
-        c.ws.send(
-          JSON.stringify({
-            type: 'lobby',
-            lobby: {
-              roomCode: this.code,
-              mode: this.mode,
-              arenaId: this.arenaId,
-              targetWins: this.targetWins,
-              mySlot: c.slot,
-              isHost: c.slot === this.hostSlot,
-              players,
-              autoStartIn: this.autoStartTimer,
-            },
-          })
-        );
+        c.ws.send(JSON.stringify({
+          type: 'lobby',
+          lobby: {
+            roomCode: this.code, mode: this.mode, arenaId: this.arenaId, biome: this.biome,
+            targetWins: this.targetWins, mySlot: c.slot, isHost: c.slot === this.hostSlot,
+            fairMode: this.fairMode, players, autoStartIn: this.autoStartTimer,
+          },
+        }));
       }
     }
   }
@@ -168,6 +177,8 @@ class Room {
         id: c ? c.id : `bot_${slot}`,
         name: c ? c.name : BOT_NAMES[slot % BOT_NAMES.length],
         charId: c ? c.charId : CHAR_LIST[slot],
+        level: c ? c.level : this.bracketLevel,
+        bombType: c ? c.bombType : 'classic',
         isBot: !c,
         isLocal: false,
         goldenMount: c ? c.goldenMount : false,
@@ -185,23 +196,15 @@ class Room {
 
     for (const c of this.clients.values()) {
       if (c.ws.readyState === 1) {
-        c.ws.send(
-          JSON.stringify({
-            type: 'match_start',
-            lobby: {
-              roomCode: this.code,
-              mode: this.mode,
-              arenaId: this.arenaId,
-              targetWins: this.targetWins,
-              mySlot: c.slot,
-              isHost: c.slot === this.hostSlot,
-              players: this.players.map((p) => ({
-                slot: p.slot, id: p.id, name: p.name, charId: p.charId, isBot: p.isBot, isHost: p.slot === this.hostSlot,
-              })),
-              autoStartIn: null,
-            },
-          })
-        );
+        c.ws.send(JSON.stringify({
+          type: 'match_start',
+          lobby: {
+            roomCode: this.code, mode: this.mode, arenaId: this.arenaId, biome: this.biome,
+            targetWins: this.targetWins, mySlot: c.slot, isHost: c.slot === this.hostSlot, fairMode: this.fairMode,
+            players: this.players.map((p) => ({ slot: p.slot, id: p.id, name: p.name, charId: p.charId, level: p.level, isBot: p.isBot, isHost: p.slot === this.hostSlot })),
+            autoStartIn: null,
+          },
+        }));
       }
     }
   }
@@ -209,20 +212,18 @@ class Room {
   setupRound() {
     const arena = ARENAS[this.arenaId];
     this.arenaRadius = arena.baseRadius;
+    this.tiltX = 0; this.tiltZ = 0;
     this.roundTimer = ROUND_DURATION;
-    this.countdownTimer = 2.4;
+    this.countdownTimer = 2.2;
     this.phase = 'countdown';
-    this.bombs = [];
-    this.pickups = [];
-    this.bombSpawnTimer = 2.2;
-    this.itemSpawnTimer = 5.5;
+    this.bombs = []; this.pickups = [];
+    this.bombSpawnTimer = 2.0; this.itemSpawnTimer = 5.0;
     this.lastRoundWinner = null;
 
-    const spawnDist = this.arenaRadius * 0.52;
+    const spawnDist = this.arenaRadius * 0.5;
     for (const p of this.players) {
       const a = SPAWN_ANGLES[p.slot % 4];
-      p.x = Math.cos(a) * spawnDist;
-      p.z = Math.sin(a) * spawnDist;
+      p.x = Math.cos(a) * spawnDist; p.z = Math.sin(a) * spawnDist;
       p.y = 0; p.vx = 0; p.vz = 0; p.vy = 0;
       p.angle = Math.atan2(-p.x, -p.z);
       p.stamina = 100; p.dashTimer = 0; p.dashCooldown = 0;
@@ -240,30 +241,15 @@ class Room {
     if (!this.started) {
       if (this.autoStartTimer !== null) {
         this.autoStartTimer -= dt;
-        if (this.autoStartTimer <= 0) {
-          this.startMatch();
-        } else if (Math.floor(this.autoStartTimer + dt) !== Math.floor(this.autoStartTimer)) {
-          this.broadcastLobby();
-        }
+        if (this.autoStartTimer <= 0) this.startMatch();
+        else if (Math.floor(this.autoStartTimer + dt) !== Math.floor(this.autoStartTimer)) this.broadcastLobby();
       }
       return;
     }
 
-    this.dropper.angle += dt * 0.65;
-    const orbit = this.arenaRadius * 0.45;
-    this.dropper.x = Math.cos(this.dropper.angle) * orbit;
-    this.dropper.z = Math.sin(this.dropper.angle * 1.3) * orbit * 0.75;
-    if (this.dropper.beamActive) {
-      this.dropper.beamTimer -= dt;
-      if (this.dropper.beamTimer <= 0) this.dropper.beamActive = false;
-    }
-
     if (this.phase === 'countdown') {
       this.countdownTimer -= dt;
-      if (this.countdownTimer <= 0) {
-        this.countdownTimer = 0;
-        this.phase = 'playing';
-      }
+      if (this.countdownTimer <= 0) { this.countdownTimer = 0; this.phase = 'playing'; }
       this.broadcastSnapshot();
       return;
     }
@@ -273,45 +259,50 @@ class Room {
       for (const p of this.players) {
         if (p.falling) { p.vy -= 26 * dt; p.y += p.vy * dt; p.x += p.vx * dt; p.z += p.vz * dt; }
       }
-      if (this.roundEndTimer <= 0) {
-        this.roundNumber++;
-        this.setupRound();
-      }
+      if (this.roundEndTimer <= 0) { this.roundNumber++; this.setupRound(); }
       this.broadcastSnapshot();
       return;
     }
 
-    if (this.phase !== 'playing') {
-      this.broadcastSnapshot();
-      return;
-    }
+    if (this.phase !== 'playing') { this.broadcastSnapshot(); return; }
 
     const arena = ARENAS[this.arenaId];
     this.roundTimer = Math.max(0, this.roundTimer - dt);
     if (arena.shrinks) {
       const progress = 1 - this.roundTimer / ROUND_DURATION;
-      this.arenaRadius = Math.max(3.2, arena.baseRadius - progress * (arena.baseRadius - 3.2) * 1.15);
+      this.arenaRadius = Math.max(3.6, arena.baseRadius - progress * (arena.baseRadius - 3.6) * 1.15);
+    }
+    if (arena.tilts) {
+      let comX = 0, comZ = 0, totalW = 0;
+      for (const p of this.players) {
+        if (!p.alive) continue;
+        const w = CHAR_SPECS[p.charId].mass * p.sizeScale;
+        comX += p.x * w; comZ += p.z * w; totalW += w;
+      }
+      const el = ROUND_DURATION - this.roundTimer;
+      const wx = Math.sin(el * 0.55) * 0.075, wz = Math.cos(el * 0.42) * 0.075;
+      const tz = totalW > 0 ? Math.max(-0.22, Math.min(0.22, -(comX / totalW) * 0.032 + wx)) : wx;
+      const tx = totalW > 0 ? Math.max(-0.22, Math.min(0.22, (comZ / totalW) * 0.032 + wz)) : wz;
+      this.tiltX += (tx - this.tiltX) * Math.min(1, dt * 2.5);
+      this.tiltZ += (tz - this.tiltZ) * Math.min(1, dt * 2.5);
     }
 
     if (arena.hasBombs) {
       this.bombSpawnTimer -= dt;
       if (this.bombSpawnTimer <= 0 && this.bombs.length < 3) {
         this.spawnBomb();
-        this.bombSpawnTimer = 5.5 + Math.random() * 2.5;
+        this.bombSpawnTimer = 5.2 + Math.random() * 2.2;
       }
     }
 
     this.itemSpawnTimer -= dt;
     if (this.itemSpawnTimer <= 0 && this.pickups.length < 2) {
       this.spawnPickup();
-      this.itemSpawnTimer = 8.0 + Math.random() * 3.0;
+      this.itemSpawnTimer = 7.8 + Math.random() * 2.8;
     }
 
     for (const p of this.players) {
-      if (p.tauntTimer > 0) {
-        p.tauntTimer -= dt;
-        if (p.tauntTimer <= 0) p.tauntText = null;
-      }
+      if (p.tauntTimer > 0) { p.tauntTimer -= dt; if (p.tauntTimer <= 0) p.tauntText = null; }
       if (!p.alive) {
         if (p.falling) { p.vy -= 26 * dt; p.y += p.vy * dt; p.x += p.vx * dt; p.z += p.vz * dt; }
         continue;
@@ -321,7 +312,6 @@ class Room {
       if (p.isBot || !client) {
         inp = this.botInput(p, dt);
       } else {
-        // Clone input BEFORE resetting queued one-shot flags!
         inp = { ...client.input };
         client.input.dashPressed = false;
         client.input.bombPressed = false;
@@ -342,17 +332,10 @@ class Room {
         const w = alive[0];
         w.wins++;
         this.lastRoundWinner = w.slot;
-        if (w.wins >= this.targetWins) {
-          this.matchWinner = w.slot;
-          this.phase = 'match_end';
-        } else {
-          this.phase = 'round_end';
-          this.roundEndTimer = 3.2;
-        }
+        if (w.wins >= this.targetWins) { this.matchWinner = w.slot; this.phase = 'match_end'; }
+        else { this.phase = 'round_end'; this.roundEndTimer = 2.8; }
       } else {
-        this.lastRoundWinner = -1;
-        this.phase = 'round_end';
-        this.roundEndTimer = 3.2;
+        this.lastRoundWinner = -1; this.phase = 'round_end'; this.roundEndTimer = 2.8;
       }
     }
 
@@ -361,6 +344,9 @@ class Room {
 
   stepPlayer(p, input, dt) {
     const spec = CHAR_SPECS[p.charId];
+    const diff = BOT_DIFFS[this.difficulty];
+    const bonus = levelBonus(p.level, this.fairMode);
+
     if (p.invulnTimer > 0) p.invulnTimer = Math.max(0, p.invulnTimer - dt);
     if (p.dashCooldown > 0) p.dashCooldown = Math.max(0, p.dashCooldown - dt);
     if (p.sizeTimer > 0) { p.sizeTimer -= dt; if (p.sizeTimer <= 0) p.sizeScale = 1.0; }
@@ -369,26 +355,24 @@ class Room {
       p.lightningTimer -= dt;
       if (p.lightningTimer <= 0) {
         p.hasLightning = false;
-        for (const o of this.players) {
-          if (o.alive && o.slot !== p.slot) { o.stunTimer = 5.0; o.dashTimer = 0; }
-        }
+        for (const o of this.players) { if (o.alive && o.slot !== p.slot) { o.stunTimer = 5.0; o.dashTimer = 0; } }
       }
     }
     if (p.hasWeight) {
       p.weightTimer -= dt;
-      if (p.weightTimer <= 0) {
-        p.hasWeight = false;
-        this.eliminate(p, 0, 0);
-        return;
-      }
+      if (p.weightTimer <= 0) { p.hasWeight = false; this.eliminate(p, 0, 0); return; }
     }
-    if (p.dashTimer <= 0) p.stamina = Math.min(100, p.stamina + STAMINA_REGEN * dt);
+    if (p.dashTimer <= 0) p.stamina = Math.min(100, p.stamina + STAMINA_REGEN * (p.isBot ? diff.regenMult : 1.05 * bonus.regenMult) * dt);
+
+    if (this.tiltX !== 0 || this.tiltZ !== 0) {
+      p.vx += -this.tiltZ * 26 * dt;
+      p.vz += this.tiltX * 26 * dt;
+    }
 
     if (p.stunTimer > 0) {
       p.stunTimer = Math.max(0, p.stunTimer - dt);
       const drag = Math.exp(-ICE_FRICTION * 0.7 * dt);
-      p.vx *= drag; p.vz *= drag;
-      p.x += p.vx * dt; p.z += p.vz * dt;
+      p.vx *= drag; p.vz *= drag; p.x += p.vx * dt; p.z += p.vz * dt;
       this.checkBounds(p);
       return;
     }
@@ -399,11 +383,10 @@ class Room {
         p.teeterTaps++;
         if (p.teeterTaps >= TEETER_TAPS_REQUIRED) {
           p.teetering = false;
-          const ix = -Math.cos(p.teeterEdgeAngle);
-          const iz = -Math.sin(p.teeterEdgeAngle);
-          p.x = Math.cos(p.teeterEdgeAngle) * (this.arenaRadius - 1.1);
-          p.z = Math.sin(p.teeterEdgeAngle) * (this.arenaRadius - 1.1);
-          p.vx = ix * 6.5; p.vz = iz * 6.5; p.invulnTimer = 0.45;
+          const ix = -Math.cos(p.teeterEdgeAngle), iz = -Math.sin(p.teeterEdgeAngle);
+          p.x = Math.cos(p.teeterEdgeAngle) * (this.arenaRadius - 1.2);
+          p.z = Math.sin(p.teeterEdgeAngle) * (this.arenaRadius - 1.2);
+          p.vx = ix * 6.5; p.vz = iz * 6.5; p.invulnTimer = 0.5;
           return;
         }
       }
@@ -416,9 +399,9 @@ class Room {
 
     if (input.bombPressed) {
       if (p.carryingBombId) this.throwBomb(p);
-      else this.tryPickupBomb(p, 1.85);
+      else this.tryPickupBomb(p, 2.6);
     } else if (!p.carryingBombId) {
-      this.tryPickupBomb(p, 0.95);
+      this.tryPickupBomb(p, 1.25);
     }
 
     const mag = Math.min(1, Math.hypot(input.moveX, input.moveZ));
@@ -427,13 +410,12 @@ class Room {
     if (mag > 0.12) p.angle = Math.atan2(dirX, dirZ);
 
     const cost = p.mounted ? spec.dashCost : 45;
-    if (input.dashPressed && p.dashTimer <= 0 && p.dashCooldown <= 0 && p.stamina >= cost) {
-      p.stamina -= cost;
-      p.dashTimer = spec.dashDuration;
-      p.dashCooldown = 0.16;
+    if (input.dashPressed && p.dashTimer <= 0 && p.dashCooldown <= 0 && p.stamina >= cost - 2) {
+      p.stamina = Math.max(0, p.stamina - cost);
+      p.dashTimer = spec.dashDuration; p.dashCooldown = 0.16;
       p.dashDirX = mag > 0.12 ? dirX : Math.sin(p.angle);
       p.dashDirZ = mag > 0.12 ? dirZ : Math.cos(p.angle);
-      const sm = p.mounted ? 1 : 0.55;
+      const sm = p.mounted ? 1 : 0.6;
       p.vx = p.dashDirX * spec.dashSpeed * sm;
       p.vz = p.dashDirZ * spec.dashSpeed * sm;
     }
@@ -441,15 +423,12 @@ class Room {
     if (p.dashTimer > 0) {
       p.dashTimer -= dt;
     } else {
-      const maxSpeed = spec.moveSpeed * (p.mounted ? 1 : 0.78);
-      p.vx += dirX * mag * ICE_ACCEL * dt;
-      p.vz += dirZ * mag * ICE_ACCEL * dt;
+      const maxSpeed = spec.moveSpeed * (p.mounted ? 1 : 0.8) * (p.hasWeight ? 0.88 : 1) * (p.isBot ? diff.speedMult : 1.04 * bonus.speedMult);
+      p.vx += dirX * mag * ICE_ACCEL * dt; p.vz += dirZ * mag * ICE_ACCEL * dt;
       const drag = Math.exp(-ICE_FRICTION * dt);
       p.vx *= drag; p.vz *= drag;
       const spd = Math.hypot(p.vx, p.vz);
-      if (spd > maxSpeed && spd < maxSpeed + 2.5 && mag > 0.1) {
-        p.vx *= maxSpeed / spd; p.vz *= maxSpeed / spd;
-      }
+      if (spd > maxSpeed && spd < maxSpeed + 2.5 && mag > 0.1) { p.vx *= maxSpeed / spd; p.vz *= maxSpeed / spd; }
     }
     p.x += p.vx * dt; p.z += p.vz * dt;
     this.checkBounds(p);
@@ -461,7 +440,7 @@ class Room {
     const a = Math.atan2(p.z, p.x);
     const nx = Math.cos(a), nz = Math.sin(a);
     const outSpd = p.vx * nx + p.vz * nz;
-    if (ARENAS[this.arenaId].hasEdgeLip && outSpd < 6.2 && dist < this.arenaRadius + 0.25) {
+    if (ARENAS[this.arenaId].hasEdgeLip && outSpd < 6.4 && dist < this.arenaRadius + 0.25) {
       p.x = nx * (this.arenaRadius - 0.35); p.z = nz * (this.arenaRadius - 0.35);
       p.vx -= nx * outSpd * 1.45; p.vz -= nz * outSpd * 1.45;
       return;
@@ -477,6 +456,7 @@ class Room {
   }
 
   resolveCollisions() {
+    const diff = BOT_DIFFS[this.difficulty];
     for (let i = 0; i < this.players.length; i++) {
       const a = this.players[i];
       if (!a.alive) continue;
@@ -493,16 +473,18 @@ class Room {
         b.x += nx * overlap * 0.5; b.z += nz * overlap * 0.5;
 
         const sA = CHAR_SPECS[a.charId], sB = CHAR_SPECS[b.charId];
+        const bA = levelBonus(a.level, this.fairMode).pushMult;
+        const bB = levelBonus(b.level, this.fairMode).pushMult;
         const mA = sA.mass * (a.sizeScale > 1.2 ? 1.6 : 1);
         const mB = sB.mass * (b.sizeScale > 1.2 ? 1.6 : 1);
 
         if (a.dashTimer > 0 && b.dashTimer <= 0 && b.invulnTimer <= 0) {
-          const f = ((a.isBot ? 8.8 : 11.4) * sA.pushForce) / mB;
+          const f = ((a.isBot ? diff.pushBase : 11.4 * bA) * sA.pushForce) / mB;
           b.vx = nx * f; b.vz = nz * f; b.invulnTimer = 0.55;
           if (!a.isBot) b.teetering = false;
           a.vx *= 0.35; a.vz *= 0.35; a.dashTimer = 0;
         } else if (b.dashTimer > 0 && a.dashTimer <= 0 && a.invulnTimer <= 0) {
-          const f = ((b.isBot ? 8.8 : 11.4) * sB.pushForce) / mA;
+          const f = ((b.isBot ? diff.pushBase : 11.4 * bB) * sB.pushForce) / mA;
           a.vx = -nx * f; a.vz = -nz * f; a.invulnTimer = 0.55;
           if (!b.isBot) a.teetering = false;
           b.vx *= 0.35; b.vz *= 0.35; b.dashTimer = 0;
@@ -528,10 +510,7 @@ class Room {
   spawnBomb() {
     const a = Math.random() * Math.PI * 2;
     const r = Math.random() * this.arenaRadius * 0.6;
-    const x = Math.cos(a) * r, z = Math.sin(a) * r;
-    this.dropper.beamActive = true; this.dropper.beamTimer = 0.65; this.dropper.beamColor = 0xff6b35;
-    this.dropper.beamTargetX = x; this.dropper.beamTargetZ = z;
-    this.bombs.push({ id: `b_${this.nextId++}`, x, y: 0.35, z, vx: 0, vy: 0, vz: 0, state: 'idle', carrierSlot: null, throwerSlot: null, fuseTimer: 12, age: 0 });
+    this.bombs.push({ id: `b_${this.nextId++}`, bombType: 'classic', x: Math.cos(a) * r, y: 0.35, z: Math.sin(a) * r, vx: 0, vy: 0, vz: 0, state: 'idle', carrierSlot: null, throwerSlot: null, fuseTimer: 12, age: 0 });
   }
 
   spawnPickup() {
@@ -539,17 +518,14 @@ class Room {
     const kind = kinds[Math.floor(Math.random() * kinds.length)];
     const a = Math.random() * Math.PI * 2;
     const r = Math.random() * this.arenaRadius * 0.56;
-    const x = Math.cos(a) * r, z = Math.sin(a) * r;
-    this.dropper.beamActive = true; this.dropper.beamTimer = 0.7; this.dropper.beamColor = 0xfacc15;
-    this.dropper.beamTargetX = x; this.dropper.beamTargetZ = z;
-    this.pickups.push({ id: `pk_${this.nextId++}`, kind, x, z, age: 0 });
+    this.pickups.push({ id: `pk_${this.nextId++}`, kind, x: Math.cos(a) * r, z: Math.sin(a) * r, age: 0 });
   }
 
   tryPickupBomb(p, range) {
     for (const b of this.bombs) {
       if (b.state !== 'idle') continue;
       if (Math.hypot(b.x - p.x, b.z - p.z) <= range) {
-        b.state = 'carried'; b.carrierSlot = p.slot; b.fuseTimer = 6.5; p.carryingBombId = b.id;
+        b.state = 'carried'; b.carrierSlot = p.slot; b.bombType = p.bombType; b.fuseTimer = 6.5; p.carryingBombId = b.id;
         return;
       }
     }
@@ -559,10 +535,10 @@ class Room {
     const b = this.bombs.find((it) => it.id === p.carryingBombId);
     p.carryingBombId = null;
     if (!b) return;
-    b.state = 'thrown'; b.carrierSlot = null; b.throwerSlot = p.slot;
+    b.state = 'thrown'; b.carrierSlot = null; b.throwerSlot = p.slot; b.bombType = p.bombType;
     const fx = Math.sin(p.angle), fz = Math.cos(p.angle);
     b.x = p.x + fx * 0.9; b.z = p.z + fz * 0.9; b.y = 1.1;
-    b.vx = fx * BOMB_THROW_SPEED + p.vx * 0.35; b.vz = fz * BOMB_THROW_SPEED + p.vz * 0.35; b.vy = 4.6; b.fuseTimer = 1.4;
+    b.vx = fx * BOMB_THROW_SPEED + p.vx * 0.35; b.vz = fz * BOMB_THROW_SPEED + p.vz * 0.35; b.vy = 4.6; b.fuseTimer = 1.45;
   }
 
   stepBombs(dt) {
@@ -576,6 +552,15 @@ class Room {
         if (b.fuseTimer <= 0) { c.carryingBombId = null; this.explodeBomb(b); continue; }
         rem.push(b);
       } else if (b.state === 'thrown') {
+        if (b.bombType === 'homing') {
+          let best = null, bestD = 99;
+          for (const p of this.players) {
+            if (!p.alive || p.slot === b.throwerSlot) continue;
+            const d = Math.hypot(p.x - b.x, p.z - b.z);
+            if (d < bestD) { bestD = d; best = p; }
+          }
+          if (best && bestD > 0.1) { b.vx += ((best.x - b.x) / bestD) * 18 * dt; b.vz += ((best.z - b.z) / bestD) * 18 * dt; }
+        }
         b.x += b.vx * dt; b.z += b.vz * dt; b.vy -= 14.5 * dt; b.y += b.vy * dt; b.fuseTimer -= dt;
         const hit = this.players.some((p) => p.alive && p.slot !== b.throwerSlot && Math.hypot(p.x - b.x, p.z - b.z) <= 0.95 * p.sizeScale);
         if (hit || b.y <= 0.35 || b.fuseTimer <= 0) { this.explodeBomb(b); continue; }
@@ -589,14 +574,17 @@ class Room {
   }
 
   explodeBomb(b) {
+    const rad = b.bombType === 'mega' ? BOMB_RADIUS * 1.55 : BOMB_RADIUS;
+    const mult = b.bombType === 'mega' ? 1.38 : 1.0;
     for (const p of this.players) {
       if (!p.alive) continue;
       const dx = p.x - b.x, dz = p.z - b.z;
       const d = Math.hypot(dx, dz);
-      if (d <= BOMB_RADIUS) {
+      if (d <= rad) {
         const nx = d > 0.01 ? dx / d : 1, nz = d > 0.01 ? dz / d : 0;
-        if (p.mounted) { p.mounted = false; p.vx += nx * 8.2; p.vz += nz * 8.2; }
-        else this.eliminate(p, nx * 5, nz * 5);
+        if (b.bombType === 'frost' && p.slot !== b.throwerSlot) p.stunTimer = Math.max(p.stunTimer, 2.5);
+        if (p.mounted) { p.mounted = false; p.vx += nx * 8.2 * mult; p.vz += nz * 8.2 * mult; }
+        else this.eliminate(p, nx * 5.5 * mult, nz * 5.5 * mult);
       }
     }
   }
@@ -609,7 +597,7 @@ class Room {
       let taken = false;
       for (const p of this.players) {
         if (!p.alive) continue;
-        if (Math.hypot(p.x - pk.x, p.z - pk.z) <= 0.95 * p.sizeScale) {
+        if (Math.hypot(p.x - pk.x, p.z - pk.z) <= 1.0 * p.sizeScale) {
           taken = true;
           if (pk.kind === 'lightning') { p.hasLightning = true; p.lightningTimer = 10; }
           else if (pk.kind === 'weight') { p.hasWeight = true; p.weightTimer = 10; }
@@ -631,17 +619,15 @@ class Room {
   }
 
   botInput(bot, dt) {
+    const diff = BOT_DIFFS[this.difficulty];
     const out = { moveX: 0, moveZ: 0, dashPressed: false, bombPressed: false, taunt: null };
     if (bot.teetering) {
       this.botTimers[bot.slot] -= dt;
-      if (this.botTimers[bot.slot] <= 0) { out.dashPressed = true; this.botTimers[bot.slot] = 0.25; }
+      if (this.botTimers[bot.slot] <= 0) { out.dashPressed = true; this.botTimers[bot.slot] = diff.teeterDelay; }
       return out;
     }
     const distC = Math.hypot(bot.x, bot.z);
-    if (distC > this.arenaRadius * 0.72) {
-      out.moveX = -bot.x / distC; out.moveZ = -bot.z / distC;
-      return out;
-    }
+    if (distC > this.arenaRadius * 0.72) { out.moveX = -bot.x / distC; out.moveZ = -bot.z / distC; return out; }
     const opps = this.players.filter((p) => p.alive && p.slot !== bot.slot);
     if (!opps.length) return out;
     opps.sort((a, b) => Math.hypot(a.x - bot.x, a.z - bot.z) - Math.hypot(b.x - bot.x, b.z - bot.z));
@@ -649,7 +635,7 @@ class Room {
     const d = Math.max(0.01, Math.hypot(t.x - bot.x, t.z - bot.z));
     out.moveX = (t.x - bot.x) / d; out.moveZ = (t.z - bot.z) / d;
     if (bot.carryingBombId && d < 6 && Math.random() < 0.08) out.bombPressed = true;
-    else if (d < 2.8 && bot.stamina >= CHAR_SPECS[bot.charId].dashCost && Math.random() < 0.05) out.dashPressed = true;
+    else if (ROUND_DURATION - this.roundTimer > diff.graceSec && d < 2.6 && bot.stamina >= CHAR_SPECS[bot.charId].dashCost && Math.random() < diff.dashChance) out.dashPressed = true;
     return out;
   }
 
@@ -657,31 +643,61 @@ class Room {
     const payload = JSON.stringify({
       type: 'snapshot',
       snapshot: {
-        phase: this.phase,
-        arenaId: this.arenaId,
-        arenaRadius: this.arenaRadius,
-        roundNumber: this.roundNumber,
-        targetWins: this.targetWins,
-        roundTimer: this.roundTimer,
-        countdownTimer: this.countdownTimer,
-        roundEndTimer: this.roundEndTimer,
-        lastRoundWinner: this.lastRoundWinner,
-        matchWinner: this.matchWinner,
-        players: this.players,
-        bombs: this.bombs,
-        pickups: this.pickups,
-        dropper: this.dropper,
+        phase: this.phase, arenaId: this.arenaId, biome: this.biome,
+        arenaRadius: this.arenaRadius, tiltX: this.tiltX, tiltZ: this.tiltZ,
+        roundNumber: this.roundNumber, targetWins: this.targetWins,
+        roundTimer: this.roundTimer, countdownTimer: this.countdownTimer, roundEndTimer: this.roundEndTimer,
+        lastRoundWinner: this.lastRoundWinner, matchWinner: this.matchWinner,
+        players: this.players, bombs: this.bombs, pickups: this.pickups,
       },
     });
-    for (const c of this.clients.values()) {
-      if (c.ws.readyState === 1) c.ws.send(payload);
-    }
+    for (const c of this.clients.values()) { if (c.ws.readyState === 1) c.ws.send(payload); }
   }
 }
 
 const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-  res.end(JSON.stringify({ status: 'ok', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  const url = new URL(req.url || '/', `http://localhost:${PORT}`);
+  if (url.pathname === '/leaderboard' && req.method === 'GET') {
+    const country = url.searchParams.get('country');
+    let entries = [...leaderboardMap.values()];
+    if (country) entries = entries.filter((e) => e.country === country);
+    entries.sort((a, b) => b.trophies - a.trophies || b.level - a.level);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ entries: entries.slice(0, 30) }));
+    return;
+  }
+
+  if (url.pathname === '/score' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const d = JSON.parse(body);
+        const name = String(d.name || '').trim().slice(0, 12);
+        if (name) {
+          const prev = leaderboardMap.get(name);
+          leaderboardMap.set(name, {
+            name,
+            country: String(d.country || 'SY').slice(0, 3).toUpperCase(),
+            level: Math.max(prev?.level || 1, Math.min(50, Number(d.level) || 1)),
+            trophies: Math.max(prev?.trophies || 0, Number(d.trophies) || 0),
+            charId: CHAR_SPECS[d.charId] ? d.charId : 'foxy',
+          });
+        }
+      } catch {}
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: 'ok', version: '2.0', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
 });
 
 const wss = new WebSocketServer({ server: httpServer });
@@ -691,35 +707,34 @@ wss.on('connection', (ws) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'quick') {
-        // Find an open unstarted quick room, or create one!
-        let target = [...rooms.values()].find((r) => r.mode === 'quick' && !r.started && r.clients.size < 4);
+        const myLvl = Math.max(1, Math.min(50, Number(msg.level) || 1));
+        // Match with an open global room within ±6 levels!
+        let target = [...rooms.values()].find(
+          (r) => r.mode === 'quick' && !r.started && r.clients.size < 4 && Math.abs(r.bracketLevel - myLvl) <= 6
+        );
         if (!target) {
           const code = makeRoomCode();
-          target = new Room(code, 'quick', msg.arenaId, msg.targetWins);
+          target = new Room(code, 'quick', msg.arenaId, msg.biome, msg.difficulty, msg.targetWins, myLvl);
           rooms.set(code, target);
         }
         target.addClient(ws, msg);
       } else if (msg.type === 'create') {
         const code = makeRoomCode();
-        const room = new Room(code, 'private', msg.arenaId, msg.targetWins);
+        const room = new Room(code, 'private', msg.arenaId, msg.biome, msg.difficulty, msg.targetWins, msg.level);
         rooms.set(code, room);
         room.addClient(ws, msg);
       } else if (msg.type === 'join') {
         const code = String(msg.roomCode || '').toUpperCase();
         const room = rooms.get(code);
         if (!room || room.started || room.clients.size >= 4) {
-          ws.send(JSON.stringify({ type: 'error', message: `Room ${code} not found or already full!` }));
+          ws.send(JSON.stringify({ type: 'error', message: `Room ${code} not found or full!` }));
           return;
         }
         room.addClient(ws, msg);
       } else if (msg.type === 'start_now' && ws._room) {
-        if (!ws._room.started && ws._slot === ws._room.hostSlot) {
-          ws._room.startMatch();
-        }
+        if (!ws._room.started && ws._slot === ws._room.hostSlot) ws._room.startMatch();
       } else if (msg.type === 'rematch' && ws._room) {
-        if (ws._room.phase === 'match_end') {
-          ws._room.startMatch();
-        }
+        if (ws._room.phase === 'match_end') ws._room.startMatch();
       } else if (msg.type === 'input' && ws._room && ws._slot !== undefined) {
         const client = ws._room.clients.get(ws._slot);
         if (client && msg.input) {
@@ -730,24 +745,18 @@ wss.on('connection', (ws) => {
           if (msg.input.taunt) client.input.taunt = String(msg.input.taunt).slice(0, 4);
         }
       }
-    } catch {
-      // ignore invalid message
-    }
+    } catch {}
   });
 
   ws.on('close', () => {
-    if (ws._room && ws._slot !== undefined) {
-      ws._room.removeClient(ws._slot);
-    }
+    if (ws._room && ws._slot !== undefined) ws._room.removeClient(ws._slot);
   });
 });
 
 setInterval(() => {
-  for (const room of rooms.values()) {
-    room.tick(TICK_DT);
-  }
+  for (const room of rooms.values()) room.tick(TICK_DT);
 }, 1000 / TICK_HZ);
 
 httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`❄️ Ice Bump: Push Party Online Server listening on port ${PORT}`);
+  console.log(`❄️ Ice Bump v2.0 Server listening on port ${PORT}`);
 });
