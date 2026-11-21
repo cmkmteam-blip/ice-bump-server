@@ -29,7 +29,7 @@ const CHAR_SPECS = {
   zappy: { dashCost: 58, dashSpeed: 15.0, dashDuration: 0.25, pushForce: 1.12, mass: 0.96, moveSpeed: 6.5 },
 };
 const CHAR_LIST = ['foxy', 'beep', 'bambu', 'zappy'];
-const BOT_NAMES = ['Shawarma', 'Falafel', 'Knafeh', 'Zaatar', 'Bataata', 'Felfel', 'Hummus', 'Labneh'];
+const BOT_NAMES = ['Waffles', 'Nugget', 'Pickles', 'Biscuit', 'Noodle', 'Taco', 'Mochi', 'Toast'];
 const SPAWN_ANGLES = [Math.PI * 0.25, Math.PI * 0.75, Math.PI * 1.25, Math.PI * 1.75];
 const BIOME_LIST = ['snow', 'desert', 'grass'];
 
