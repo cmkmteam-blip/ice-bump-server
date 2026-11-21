@@ -1,0 +1,753 @@
+import http from 'http';
+import { WebSocketServer } from 'ws';
+
+/**
+ * Ice Bump: Push Party Online — Authoritative 4-Player WebSocket Server
+ * Supports:
+ *  - Global Quick Match (joins open room, auto-fills smart AI bots after 6 seconds!)
+ *  - Private 4-Letter Friend Rooms (create / join by code, host starts anytime with bots)
+ *  - Full 20Hz authoritative physics, bombs, lightning, weight, grow/shrink, edge teetering!
+ */
+
+const PORT = Number(process.env.PORT || 8080);
+const TICK_HZ = 20;
+const TICK_DT = 1 / TICK_HZ;
+const ROUND_DURATION = 90;
+const STAMINA_REGEN = 46;
+const ICE_ACCEL = 24;
+const ICE_FRICTION = 2.65;
+const TEETER_DURATION = 2.1;
+const TEETER_TAPS_REQUIRED = 2;
+const INSTANT_KO_SPEED = 14.5;
+const BOMB_RADIUS = 2.1;
+const BOMB_THROW_SPEED = 13.5;
+
+const CHAR_SPECS = {
+  foxy: { dashCost: 50, dashSpeed: 14.2, dashDuration: 0.24, pushForce: 1.0, mass: 1.0, moveSpeed: 6.2 },
+  beep: { dashCost: 100, dashSpeed: 15.4, dashDuration: 0.24, pushForce: 1.48, mass: 0.92, moveSpeed: 5.9 },
+  bambu: { dashCost: 72, dashSpeed: 15.6, dashDuration: 0.27, pushForce: 1.32, mass: 1.35, moveSpeed: 5.5 },
+  zappy: { dashCost: 58, dashSpeed: 15.0, dashDuration: 0.25, pushForce: 1.12, mass: 0.96, moveSpeed: 6.5 },
+};
+const CHAR_LIST = ['foxy', 'beep', 'bambu', 'zappy'];
+const BOT_NAMES = ['Frosty', 'ChillBot', 'Yeti99', 'Pingu', 'IceKing', 'Slushie'];
+const SPAWN_ANGLES = [Math.PI * 0.25, Math.PI * 0.75, Math.PI * 1.25, Math.PI * 1.75];
+
+const ARENAS = {
+  chaos: { baseRadius: 8.2, hasEdgeLip: false, shrinks: false, hasBombs: true },
+  classic: { baseRadius: 8.6, hasEdgeLip: true, shrinks: false, hasBombs: false },
+  meltdown: { baseRadius: 8.4, hasEdgeLip: false, shrinks: true, hasBombs: true },
+};
+
+const rooms = new Map();
+
+function makeRoomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return rooms.has(code) ? makeRoomCode() : code;
+}
+
+class Room {
+  constructor(code, mode, arenaId, targetWins) {
+    this.code = code;
+    this.mode = mode; // 'quick' | 'private'
+    this.arenaId = ARENAS[arenaId] ? arenaId : 'chaos';
+    this.targetWins = Math.max(2, Math.min(7, Number(targetWins) || 3));
+    this.clients = new Map(); // slot -> { ws, id, name, charId, goldenMount, input }
+    this.hostSlot = 0;
+    this.started = false;
+    this.autoStartTimer = mode === 'quick' ? 6.0 : null;
+
+    // Simulation state
+    this.phase = 'lobby';
+    this.arenaRadius = ARENAS[this.arenaId].baseRadius;
+    this.roundNumber = 1;
+    this.roundTimer = ROUND_DURATION;
+    this.countdownTimer = 0;
+    this.roundEndTimer = 0;
+    this.lastRoundWinner = null;
+    this.matchWinner = null;
+    this.players = [];
+    this.bombs = [];
+    this.pickups = [];
+    this.bombSpawnTimer = 2.5;
+    this.itemSpawnTimer = 5.0;
+    this.nextId = 1;
+    this.botTimers = [0, 0, 0, 0];
+    this.dropper = { x: 0, y: 4.8, z: 0, angle: 0, beamActive: false, beamTimer: 0, beamColor: 0x38bdf8, beamTargetX: 0, beamTargetZ: 0 };
+  }
+
+  addClient(ws, info) {
+    let slot = -1;
+    for (let i = 0; i < 4; i++) {
+      if (!this.clients.has(i)) {
+        slot = i;
+        break;
+      }
+    }
+    if (slot === -1) return null;
+    if (this.clients.size === 0) this.hostSlot = slot;
+
+    const client = {
+      ws,
+      slot,
+      id: `p_${Date.now()}_${slot}`,
+      name: (info.name || `Player${slot + 1}`).slice(0, 12),
+      charId: CHAR_SPECS[info.charId] ? info.charId : CHAR_LIST[slot],
+      goldenMount: Boolean(info.goldenMount),
+      input: { moveX: 0, moveZ: 0, dashPressed: false, bombPressed: false, taunt: null },
+    };
+    this.clients.set(slot, client);
+    ws._room = this;
+    ws._slot = slot;
+
+    this.broadcastLobby();
+    if (this.clients.size === 4 && !this.started) {
+      this.startMatch();
+    }
+    return client;
+  }
+
+  removeClient(slot) {
+    this.clients.delete(slot);
+    if (this.clients.size === 0) {
+      rooms.delete(this.code);
+      return;
+    }
+    if (this.hostSlot === slot) {
+      this.hostSlot = [...this.clients.keys()][0];
+    }
+    if (this.started && this.players[slot]) {
+      this.players[slot].isBot = true; // Seamless bot takeover if someone disconnects!
+    } else {
+      this.broadcastLobby();
+    }
+  }
+
+  broadcastLobby() {
+    const players = [...this.clients.values()].map((c) => ({
+      slot: c.slot,
+      id: c.id,
+      name: c.name,
+      charId: c.charId,
+      isBot: false,
+      isHost: c.slot === this.hostSlot,
+    }));
+    for (const c of this.clients.values()) {
+      if (c.ws.readyState === 1) {
+        c.ws.send(
+          JSON.stringify({
+            type: 'lobby',
+            lobby: {
+              roomCode: this.code,
+              mode: this.mode,
+              arenaId: this.arenaId,
+              targetWins: this.targetWins,
+              mySlot: c.slot,
+              isHost: c.slot === this.hostSlot,
+              players,
+              autoStartIn: this.autoStartTimer,
+            },
+          })
+        );
+      }
+    }
+  }
+
+  startMatch() {
+    this.started = true;
+    this.autoStartTimer = null;
+    this.roundNumber = 1;
+    this.matchWinner = null;
+    this.players = [];
+
+    for (let slot = 0; slot < 4; slot++) {
+      const c = this.clients.get(slot);
+      this.players.push({
+        slot,
+        id: c ? c.id : `bot_${slot}`,
+        name: c ? c.name : BOT_NAMES[slot % BOT_NAMES.length],
+        charId: c ? c.charId : CHAR_LIST[slot],
+        isBot: !c,
+        isLocal: false,
+        goldenMount: c ? c.goldenMount : false,
+        x: 0, y: 0, z: 0, vx: 0, vz: 0, vy: 0, angle: 0,
+        stamina: 100, dashTimer: 0, dashCooldown: 0, dashDirX: 0, dashDirZ: 1,
+        mounted: true, alive: true, falling: false,
+        teetering: false, teeterTimer: 0, teeterTaps: 0, teeterEdgeAngle: 0,
+        carryingBombId: null, sizeScale: 1, sizeTimer: 0, stunTimer: 0, invulnTimer: 0,
+        hasLightning: false, lightningTimer: 0, hasWeight: false, weightTimer: 0,
+        tauntText: null, tauntTimer: 0, wins: 0, kos: 0,
+      });
+    }
+
+    this.setupRound();
+
+    for (const c of this.clients.values()) {
+      if (c.ws.readyState === 1) {
+        c.ws.send(
+          JSON.stringify({
+            type: 'match_start',
+            lobby: {
+              roomCode: this.code,
+              mode: this.mode,
+              arenaId: this.arenaId,
+              targetWins: this.targetWins,
+              mySlot: c.slot,
+              isHost: c.slot === this.hostSlot,
+              players: this.players.map((p) => ({
+                slot: p.slot, id: p.id, name: p.name, charId: p.charId, isBot: p.isBot, isHost: p.slot === this.hostSlot,
+              })),
+              autoStartIn: null,
+            },
+          })
+        );
+      }
+    }
+  }
+
+  setupRound() {
+    const arena = ARENAS[this.arenaId];
+    this.arenaRadius = arena.baseRadius;
+    this.roundTimer = ROUND_DURATION;
+    this.countdownTimer = 2.4;
+    this.phase = 'countdown';
+    this.bombs = [];
+    this.pickups = [];
+    this.bombSpawnTimer = 2.2;
+    this.itemSpawnTimer = 5.5;
+    this.lastRoundWinner = null;
+
+    const spawnDist = this.arenaRadius * 0.52;
+    for (const p of this.players) {
+      const a = SPAWN_ANGLES[p.slot % 4];
+      p.x = Math.cos(a) * spawnDist;
+      p.z = Math.sin(a) * spawnDist;
+      p.y = 0; p.vx = 0; p.vz = 0; p.vy = 0;
+      p.angle = Math.atan2(-p.x, -p.z);
+      p.stamina = 100; p.dashTimer = 0; p.dashCooldown = 0;
+      p.mounted = true; p.alive = true; p.falling = false;
+      p.teetering = false; p.teeterTimer = 0; p.teeterTaps = 0;
+      p.carryingBombId = null; p.sizeScale = 1; p.sizeTimer = 0;
+      p.stunTimer = 0; p.invulnTimer = 0;
+      p.hasLightning = false; p.lightningTimer = 0;
+      p.hasWeight = false; p.weightTimer = 0;
+      p.tauntText = null; p.tauntTimer = 0;
+    }
+  }
+
+  tick(dt) {
+    if (!this.started) {
+      if (this.autoStartTimer !== null) {
+        this.autoStartTimer -= dt;
+        if (this.autoStartTimer <= 0) {
+          this.startMatch();
+        } else if (Math.floor(this.autoStartTimer + dt) !== Math.floor(this.autoStartTimer)) {
+          this.broadcastLobby();
+        }
+      }
+      return;
+    }
+
+    this.dropper.angle += dt * 0.65;
+    const orbit = this.arenaRadius * 0.45;
+    this.dropper.x = Math.cos(this.dropper.angle) * orbit;
+    this.dropper.z = Math.sin(this.dropper.angle * 1.3) * orbit * 0.75;
+    if (this.dropper.beamActive) {
+      this.dropper.beamTimer -= dt;
+      if (this.dropper.beamTimer <= 0) this.dropper.beamActive = false;
+    }
+
+    if (this.phase === 'countdown') {
+      this.countdownTimer -= dt;
+      if (this.countdownTimer <= 0) {
+        this.countdownTimer = 0;
+        this.phase = 'playing';
+      }
+      this.broadcastSnapshot();
+      return;
+    }
+
+    if (this.phase === 'round_end') {
+      this.roundEndTimer -= dt;
+      for (const p of this.players) {
+        if (p.falling) { p.vy -= 26 * dt; p.y += p.vy * dt; p.x += p.vx * dt; p.z += p.vz * dt; }
+      }
+      if (this.roundEndTimer <= 0) {
+        this.roundNumber++;
+        this.setupRound();
+      }
+      this.broadcastSnapshot();
+      return;
+    }
+
+    if (this.phase !== 'playing') {
+      this.broadcastSnapshot();
+      return;
+    }
+
+    const arena = ARENAS[this.arenaId];
+    this.roundTimer = Math.max(0, this.roundTimer - dt);
+    if (arena.shrinks) {
+      const progress = 1 - this.roundTimer / ROUND_DURATION;
+      this.arenaRadius = Math.max(3.2, arena.baseRadius - progress * (arena.baseRadius - 3.2) * 1.15);
+    }
+
+    if (arena.hasBombs) {
+      this.bombSpawnTimer -= dt;
+      if (this.bombSpawnTimer <= 0 && this.bombs.length < 3) {
+        this.spawnBomb();
+        this.bombSpawnTimer = 5.5 + Math.random() * 2.5;
+      }
+    }
+
+    this.itemSpawnTimer -= dt;
+    if (this.itemSpawnTimer <= 0 && this.pickups.length < 2) {
+      this.spawnPickup();
+      this.itemSpawnTimer = 8.0 + Math.random() * 3.0;
+    }
+
+    for (const p of this.players) {
+      if (p.tauntTimer > 0) {
+        p.tauntTimer -= dt;
+        if (p.tauntTimer <= 0) p.tauntText = null;
+      }
+      if (!p.alive) {
+        if (p.falling) { p.vy -= 26 * dt; p.y += p.vy * dt; p.x += p.vx * dt; p.z += p.vz * dt; }
+        continue;
+      }
+      const client = this.clients.get(p.slot);
+      let inp;
+      if (p.isBot || !client) {
+        inp = this.botInput(p, dt);
+      } else {
+        // Clone input BEFORE resetting queued one-shot flags!
+        inp = { ...client.input };
+        client.input.dashPressed = false;
+        client.input.bombPressed = false;
+        client.input.taunt = null;
+      }
+      if (inp.taunt) { p.tauntText = inp.taunt; p.tauntTimer = 2.0; }
+      this.stepPlayer(p, inp, dt);
+    }
+
+    this.resolveCollisions();
+    this.stepBombs(dt);
+    this.stepPickups(dt);
+
+    const alive = this.players.filter((p) => p.alive);
+    if (alive.length <= 1 || this.roundTimer <= 0) {
+      if (alive.length >= 1) {
+        alive.sort((a, b) => Math.hypot(a.x, a.z) - Math.hypot(b.x, b.z));
+        const w = alive[0];
+        w.wins++;
+        this.lastRoundWinner = w.slot;
+        if (w.wins >= this.targetWins) {
+          this.matchWinner = w.slot;
+          this.phase = 'match_end';
+        } else {
+          this.phase = 'round_end';
+          this.roundEndTimer = 3.2;
+        }
+      } else {
+        this.lastRoundWinner = -1;
+        this.phase = 'round_end';
+        this.roundEndTimer = 3.2;
+      }
+    }
+
+    this.broadcastSnapshot();
+  }
+
+  stepPlayer(p, input, dt) {
+    const spec = CHAR_SPECS[p.charId];
+    if (p.invulnTimer > 0) p.invulnTimer = Math.max(0, p.invulnTimer - dt);
+    if (p.dashCooldown > 0) p.dashCooldown = Math.max(0, p.dashCooldown - dt);
+    if (p.sizeTimer > 0) { p.sizeTimer -= dt; if (p.sizeTimer <= 0) p.sizeScale = 1.0; }
+
+    if (p.hasLightning) {
+      p.lightningTimer -= dt;
+      if (p.lightningTimer <= 0) {
+        p.hasLightning = false;
+        for (const o of this.players) {
+          if (o.alive && o.slot !== p.slot) { o.stunTimer = 5.0; o.dashTimer = 0; }
+        }
+      }
+    }
+    if (p.hasWeight) {
+      p.weightTimer -= dt;
+      if (p.weightTimer <= 0) {
+        p.hasWeight = false;
+        this.eliminate(p, 0, 0);
+        return;
+      }
+    }
+    if (p.dashTimer <= 0) p.stamina = Math.min(100, p.stamina + STAMINA_REGEN * dt);
+
+    if (p.stunTimer > 0) {
+      p.stunTimer = Math.max(0, p.stunTimer - dt);
+      const drag = Math.exp(-ICE_FRICTION * 0.7 * dt);
+      p.vx *= drag; p.vz *= drag;
+      p.x += p.vx * dt; p.z += p.vz * dt;
+      this.checkBounds(p);
+      return;
+    }
+
+    if (p.teetering) {
+      p.teeterTimer -= dt;
+      if (input.dashPressed) {
+        p.teeterTaps++;
+        if (p.teeterTaps >= TEETER_TAPS_REQUIRED) {
+          p.teetering = false;
+          const ix = -Math.cos(p.teeterEdgeAngle);
+          const iz = -Math.sin(p.teeterEdgeAngle);
+          p.x = Math.cos(p.teeterEdgeAngle) * (this.arenaRadius - 1.1);
+          p.z = Math.sin(p.teeterEdgeAngle) * (this.arenaRadius - 1.1);
+          p.vx = ix * 6.5; p.vz = iz * 6.5; p.invulnTimer = 0.45;
+          return;
+        }
+      }
+      if (p.teeterTimer <= 0) {
+        p.teetering = false;
+        this.eliminate(p, Math.cos(p.teeterEdgeAngle) * 3.5, Math.sin(p.teeterEdgeAngle) * 3.5);
+      }
+      return;
+    }
+
+    if (input.bombPressed) {
+      if (p.carryingBombId) this.throwBomb(p);
+      else this.tryPickupBomb(p, 1.85);
+    } else if (!p.carryingBombId) {
+      this.tryPickupBomb(p, 0.95);
+    }
+
+    const mag = Math.min(1, Math.hypot(input.moveX, input.moveZ));
+    const dirX = mag > 0.08 ? input.moveX / mag : 0;
+    const dirZ = mag > 0.08 ? input.moveZ / mag : 0;
+    if (mag > 0.12) p.angle = Math.atan2(dirX, dirZ);
+
+    const cost = p.mounted ? spec.dashCost : 45;
+    if (input.dashPressed && p.dashTimer <= 0 && p.dashCooldown <= 0 && p.stamina >= cost) {
+      p.stamina -= cost;
+      p.dashTimer = spec.dashDuration;
+      p.dashCooldown = 0.16;
+      p.dashDirX = mag > 0.12 ? dirX : Math.sin(p.angle);
+      p.dashDirZ = mag > 0.12 ? dirZ : Math.cos(p.angle);
+      const sm = p.mounted ? 1 : 0.55;
+      p.vx = p.dashDirX * spec.dashSpeed * sm;
+      p.vz = p.dashDirZ * spec.dashSpeed * sm;
+    }
+
+    if (p.dashTimer > 0) {
+      p.dashTimer -= dt;
+    } else {
+      const maxSpeed = spec.moveSpeed * (p.mounted ? 1 : 0.78);
+      p.vx += dirX * mag * ICE_ACCEL * dt;
+      p.vz += dirZ * mag * ICE_ACCEL * dt;
+      const drag = Math.exp(-ICE_FRICTION * dt);
+      p.vx *= drag; p.vz *= drag;
+      const spd = Math.hypot(p.vx, p.vz);
+      if (spd > maxSpeed && spd < maxSpeed + 2.5 && mag > 0.1) {
+        p.vx *= maxSpeed / spd; p.vz *= maxSpeed / spd;
+      }
+    }
+    p.x += p.vx * dt; p.z += p.vz * dt;
+    this.checkBounds(p);
+  }
+
+  checkBounds(p) {
+    const dist = Math.hypot(p.x, p.z);
+    if (dist <= this.arenaRadius - 0.35) return;
+    const a = Math.atan2(p.z, p.x);
+    const nx = Math.cos(a), nz = Math.sin(a);
+    const outSpd = p.vx * nx + p.vz * nz;
+    if (ARENAS[this.arenaId].hasEdgeLip && outSpd < 6.2 && dist < this.arenaRadius + 0.25) {
+      p.x = nx * (this.arenaRadius - 0.35); p.z = nz * (this.arenaRadius - 0.35);
+      p.vx -= nx * outSpd * 1.45; p.vz -= nz * outSpd * 1.45;
+      return;
+    }
+    const isSelfDash = p.dashTimer > 0;
+    if (!p.mounted || p.stunTimer > 0 || (!isSelfDash && outSpd >= INSTANT_KO_SPEED)) {
+      this.eliminate(p, p.vx * 0.7 + nx * 3.2, p.vz * 0.7 + nz * 3.2);
+      return;
+    }
+    p.teetering = true; p.teeterTimer = TEETER_DURATION; p.teeterTaps = 0; p.teeterEdgeAngle = a;
+    p.x = nx * (this.arenaRadius - 0.08); p.z = nz * (this.arenaRadius - 0.08);
+    p.vx = 0; p.vz = 0;
+  }
+
+  resolveCollisions() {
+    for (let i = 0; i < this.players.length; i++) {
+      const a = this.players[i];
+      if (!a.alive) continue;
+      for (let j = i + 1; j < this.players.length; j++) {
+        const b = this.players[j];
+        if (!b.alive) continue;
+        const minDist = 0.62 * (a.sizeScale + b.sizeScale);
+        const dx = b.x - a.x, dz = b.z - a.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist >= minDist || dist < 0.0001) continue;
+        const nx = dx / dist, nz = dz / dist;
+        const overlap = minDist - dist;
+        a.x -= nx * overlap * 0.5; a.z -= nz * overlap * 0.5;
+        b.x += nx * overlap * 0.5; b.z += nz * overlap * 0.5;
+
+        const sA = CHAR_SPECS[a.charId], sB = CHAR_SPECS[b.charId];
+        const mA = sA.mass * (a.sizeScale > 1.2 ? 1.6 : 1);
+        const mB = sB.mass * (b.sizeScale > 1.2 ? 1.6 : 1);
+
+        if (a.dashTimer > 0 && b.dashTimer <= 0 && b.invulnTimer <= 0) {
+          const f = ((a.isBot ? 8.8 : 11.4) * sA.pushForce) / mB;
+          b.vx = nx * f; b.vz = nz * f; b.invulnTimer = 0.55;
+          if (!a.isBot) b.teetering = false;
+          a.vx *= 0.35; a.vz *= 0.35; a.dashTimer = 0;
+        } else if (b.dashTimer > 0 && a.dashTimer <= 0 && a.invulnTimer <= 0) {
+          const f = ((b.isBot ? 8.8 : 11.4) * sB.pushForce) / mA;
+          a.vx = -nx * f; a.vz = -nz * f; a.invulnTimer = 0.55;
+          if (!b.isBot) a.teetering = false;
+          b.vx *= 0.35; b.vz *= 0.35; b.dashTimer = 0;
+        } else {
+          const sep = (b.vx - a.vx) * nx + (b.vz - a.vz) * nz;
+          if (sep < 0) {
+            const imp = (-1.9 * sep) / (1 / mA + 1 / mB);
+            a.vx -= (imp / mA) * nx; a.vz -= (imp / mA) * nz;
+            b.vx += (imp / mB) * nx; b.vz += (imp / mB) * nz;
+          }
+        }
+
+        if (a.invulnTimer <= 0 && b.invulnTimer <= 0) {
+          if (a.hasLightning && !b.hasLightning) { a.hasLightning = false; b.hasLightning = true; b.lightningTimer = a.lightningTimer; a.invulnTimer = b.invulnTimer = 0.45; }
+          else if (b.hasLightning && !a.hasLightning) { b.hasLightning = false; a.hasLightning = true; a.lightningTimer = b.lightningTimer; a.invulnTimer = b.invulnTimer = 0.45; }
+          if (a.hasWeight && !b.hasWeight) { a.hasWeight = false; b.hasWeight = true; b.weightTimer = a.weightTimer; a.invulnTimer = b.invulnTimer = 0.45; }
+          else if (b.hasWeight && !a.hasWeight) { b.hasWeight = false; a.hasWeight = true; a.weightTimer = b.weightTimer; a.invulnTimer = b.invulnTimer = 0.45; }
+        }
+      }
+    }
+  }
+
+  spawnBomb() {
+    const a = Math.random() * Math.PI * 2;
+    const r = Math.random() * this.arenaRadius * 0.6;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    this.dropper.beamActive = true; this.dropper.beamTimer = 0.65; this.dropper.beamColor = 0xff6b35;
+    this.dropper.beamTargetX = x; this.dropper.beamTargetZ = z;
+    this.bombs.push({ id: `b_${this.nextId++}`, x, y: 0.35, z, vx: 0, vy: 0, vz: 0, state: 'idle', carrierSlot: null, throwerSlot: null, fuseTimer: 12, age: 0 });
+  }
+
+  spawnPickup() {
+    const kinds = ['lightning', 'weight', 'grow', 'shrink'];
+    const kind = kinds[Math.floor(Math.random() * kinds.length)];
+    const a = Math.random() * Math.PI * 2;
+    const r = Math.random() * this.arenaRadius * 0.56;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    this.dropper.beamActive = true; this.dropper.beamTimer = 0.7; this.dropper.beamColor = 0xfacc15;
+    this.dropper.beamTargetX = x; this.dropper.beamTargetZ = z;
+    this.pickups.push({ id: `pk_${this.nextId++}`, kind, x, z, age: 0 });
+  }
+
+  tryPickupBomb(p, range) {
+    for (const b of this.bombs) {
+      if (b.state !== 'idle') continue;
+      if (Math.hypot(b.x - p.x, b.z - p.z) <= range) {
+        b.state = 'carried'; b.carrierSlot = p.slot; b.fuseTimer = 6.5; p.carryingBombId = b.id;
+        return;
+      }
+    }
+  }
+
+  throwBomb(p) {
+    const b = this.bombs.find((it) => it.id === p.carryingBombId);
+    p.carryingBombId = null;
+    if (!b) return;
+    b.state = 'thrown'; b.carrierSlot = null; b.throwerSlot = p.slot;
+    const fx = Math.sin(p.angle), fz = Math.cos(p.angle);
+    b.x = p.x + fx * 0.9; b.z = p.z + fz * 0.9; b.y = 1.1;
+    b.vx = fx * BOMB_THROW_SPEED + p.vx * 0.35; b.vz = fz * BOMB_THROW_SPEED + p.vz * 0.35; b.vy = 4.6; b.fuseTimer = 1.4;
+  }
+
+  stepBombs(dt) {
+    const rem = [];
+    for (const b of this.bombs) {
+      b.age += dt;
+      if (b.state === 'carried') {
+        const c = this.players[b.carrierSlot];
+        if (!c || !c.alive) { b.state = 'idle'; b.carrierSlot = null; b.y = 0.35; rem.push(b); continue; }
+        b.x = c.x; b.z = c.z; b.y = 1.85 * c.sizeScale; b.fuseTimer -= dt;
+        if (b.fuseTimer <= 0) { c.carryingBombId = null; this.explodeBomb(b); continue; }
+        rem.push(b);
+      } else if (b.state === 'thrown') {
+        b.x += b.vx * dt; b.z += b.vz * dt; b.vy -= 14.5 * dt; b.y += b.vy * dt; b.fuseTimer -= dt;
+        const hit = this.players.some((p) => p.alive && p.slot !== b.throwerSlot && Math.hypot(p.x - b.x, p.z - b.z) <= 0.95 * p.sizeScale);
+        if (hit || b.y <= 0.35 || b.fuseTimer <= 0) { this.explodeBomb(b); continue; }
+        rem.push(b);
+      } else {
+        b.fuseTimer -= dt;
+        if (b.fuseTimer > 0) rem.push(b);
+      }
+    }
+    this.bombs = rem;
+  }
+
+  explodeBomb(b) {
+    for (const p of this.players) {
+      if (!p.alive) continue;
+      const dx = p.x - b.x, dz = p.z - b.z;
+      const d = Math.hypot(dx, dz);
+      if (d <= BOMB_RADIUS) {
+        const nx = d > 0.01 ? dx / d : 1, nz = d > 0.01 ? dz / d : 0;
+        if (p.mounted) { p.mounted = false; p.vx += nx * 8.2; p.vz += nz * 8.2; }
+        else this.eliminate(p, nx * 5, nz * 5);
+      }
+    }
+  }
+
+  stepPickups(dt) {
+    const rem = [];
+    for (const pk of this.pickups) {
+      pk.age += dt;
+      if (pk.age > 14) continue;
+      let taken = false;
+      for (const p of this.players) {
+        if (!p.alive) continue;
+        if (Math.hypot(p.x - pk.x, p.z - pk.z) <= 0.95 * p.sizeScale) {
+          taken = true;
+          if (pk.kind === 'lightning') { p.hasLightning = true; p.lightningTimer = 10; }
+          else if (pk.kind === 'weight') { p.hasWeight = true; p.weightTimer = 10; }
+          else if (pk.kind === 'grow') { p.sizeScale = 1.55; p.sizeTimer = 10; }
+          else { p.sizeScale = 0.62; p.sizeTimer = 10; }
+          break;
+        }
+      }
+      if (!taken) rem.push(pk);
+    }
+    this.pickups = rem;
+  }
+
+  eliminate(p, vx, vz) {
+    if (!p.alive) return;
+    p.alive = false; p.falling = true; p.teetering = false;
+    p.hasLightning = false; p.hasWeight = false; p.carryingBombId = null;
+    p.vx = vx; p.vz = vz; p.vy = 2.8;
+  }
+
+  botInput(bot, dt) {
+    const out = { moveX: 0, moveZ: 0, dashPressed: false, bombPressed: false, taunt: null };
+    if (bot.teetering) {
+      this.botTimers[bot.slot] -= dt;
+      if (this.botTimers[bot.slot] <= 0) { out.dashPressed = true; this.botTimers[bot.slot] = 0.25; }
+      return out;
+    }
+    const distC = Math.hypot(bot.x, bot.z);
+    if (distC > this.arenaRadius * 0.72) {
+      out.moveX = -bot.x / distC; out.moveZ = -bot.z / distC;
+      return out;
+    }
+    const opps = this.players.filter((p) => p.alive && p.slot !== bot.slot);
+    if (!opps.length) return out;
+    opps.sort((a, b) => Math.hypot(a.x - bot.x, a.z - bot.z) - Math.hypot(b.x - bot.x, b.z - bot.z));
+    const t = opps[0];
+    const d = Math.max(0.01, Math.hypot(t.x - bot.x, t.z - bot.z));
+    out.moveX = (t.x - bot.x) / d; out.moveZ = (t.z - bot.z) / d;
+    if (bot.carryingBombId && d < 6 && Math.random() < 0.08) out.bombPressed = true;
+    else if (d < 2.8 && bot.stamina >= CHAR_SPECS[bot.charId].dashCost && Math.random() < 0.05) out.dashPressed = true;
+    return out;
+  }
+
+  broadcastSnapshot() {
+    const payload = JSON.stringify({
+      type: 'snapshot',
+      snapshot: {
+        phase: this.phase,
+        arenaId: this.arenaId,
+        arenaRadius: this.arenaRadius,
+        roundNumber: this.roundNumber,
+        targetWins: this.targetWins,
+        roundTimer: this.roundTimer,
+        countdownTimer: this.countdownTimer,
+        roundEndTimer: this.roundEndTimer,
+        lastRoundWinner: this.lastRoundWinner,
+        matchWinner: this.matchWinner,
+        players: this.players,
+        bombs: this.bombs,
+        pickups: this.pickups,
+        dropper: this.dropper,
+      },
+    });
+    for (const c of this.clients.values()) {
+      if (c.ws.readyState === 1) c.ws.send(payload);
+    }
+  }
+}
+
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.end(JSON.stringify({ status: 'ok', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
+});
+
+const wss = new WebSocketServer({ server: httpServer });
+
+wss.on('connection', (ws) => {
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'quick') {
+        // Find an open unstarted quick room, or create one!
+        let target = [...rooms.values()].find((r) => r.mode === 'quick' && !r.started && r.clients.size < 4);
+        if (!target) {
+          const code = makeRoomCode();
+          target = new Room(code, 'quick', msg.arenaId, msg.targetWins);
+          rooms.set(code, target);
+        }
+        target.addClient(ws, msg);
+      } else if (msg.type === 'create') {
+        const code = makeRoomCode();
+        const room = new Room(code, 'private', msg.arenaId, msg.targetWins);
+        rooms.set(code, room);
+        room.addClient(ws, msg);
+      } else if (msg.type === 'join') {
+        const code = String(msg.roomCode || '').toUpperCase();
+        const room = rooms.get(code);
+        if (!room || room.started || room.clients.size >= 4) {
+          ws.send(JSON.stringify({ type: 'error', message: `Room ${code} not found or already full!` }));
+          return;
+        }
+        room.addClient(ws, msg);
+      } else if (msg.type === 'start_now' && ws._room) {
+        if (!ws._room.started && ws._slot === ws._room.hostSlot) {
+          ws._room.startMatch();
+        }
+      } else if (msg.type === 'rematch' && ws._room) {
+        if (ws._room.phase === 'match_end') {
+          ws._room.startMatch();
+        }
+      } else if (msg.type === 'input' && ws._room && ws._slot !== undefined) {
+        const client = ws._room.clients.get(ws._slot);
+        if (client && msg.input) {
+          client.input.moveX = Number(msg.input.moveX) || 0;
+          client.input.moveZ = Number(msg.input.moveZ) || 0;
+          if (msg.input.dashPressed) client.input.dashPressed = true;
+          if (msg.input.bombPressed) client.input.bombPressed = true;
+          if (msg.input.taunt) client.input.taunt = String(msg.input.taunt).slice(0, 4);
+        }
+      }
+    } catch {
+      // ignore invalid message
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws._room && ws._slot !== undefined) {
+      ws._room.removeClient(ws._slot);
+    }
+  });
+});
+
+setInterval(() => {
+  for (const room of rooms.values()) {
+    room.tick(TICK_DT);
+  }
+}, 1000 / TICK_HZ);
+
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`❄️ Ice Bump: Push Party Online Server listening on port ${PORT}`);
+});

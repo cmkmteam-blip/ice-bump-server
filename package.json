@@ -1,0 +1,13 @@
+{
+  "name": "ice-bump-server",
+  "version": "1.0.0",
+  "description": "Authoritative 4-Player WebSocket Server for Ice Bump: Push Party Online",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.1"
+  }
+}
