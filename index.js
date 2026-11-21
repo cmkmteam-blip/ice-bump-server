@@ -41,9 +41,8 @@ const ARENAS = {
 };
 
 const BOT_DIFFS = {
-  easy: { speedMult: 0.62, pushBase: 6.2, regenMult: 0.5, dashChance: 0.005, teeterDelay: 1.25, graceSec: 3.0 },
-  medium: { speedMult: 0.78, pushBase: 8.2, regenMult: 0.68, dashChance: 0.011, teeterDelay: 0.85, graceSec: 2.0 },
-  hard: { speedMult: 0.94, pushBase: 10.2, regenMult: 0.86, dashChance: 0.02, teeterDelay: 0.5, graceSec: 1.0 },
+  standard: { speedMult: 0.78, pushBase: 8.2, regenMult: 0.68, dashChance: 0.011, teeterDelay: 0.85, graceSec: 2.0 },
+  difficult: { speedMult: 1.04, pushBase: 11.4, regenMult: 0.96, dashChance: 0.028, teeterDelay: 0.36, graceSec: 0.6 },
 };
 
 function levelBonus(level, fairMode) {
@@ -82,7 +81,7 @@ class Room {
     this.bracketLevel = Number(hostLevel) || 1;
     this.arenaId = ARENAS[arenaId] ? arenaId : 'chaos';
     this.biome = BIOME_LIST.includes(biome) ? biome : BIOME_LIST[Math.floor(Math.random() * BIOME_LIST.length)];
-    this.difficulty = BOT_DIFFS[difficulty] ? difficulty : 'medium';
+    this.difficulty = BOT_DIFFS[difficulty] ? difficulty : 'standard';
     this.targetWins = Math.max(2, Math.min(7, Number(targetWins) || 3));
     this.clients = new Map();
     this.hostSlot = 0;
@@ -350,7 +349,7 @@ class Room {
 
   stepPlayer(p, input, dt) {
     const spec = CHAR_SPECS[p.charId];
-    const diff = BOT_DIFFS[this.difficulty] || BOT_DIFFS.medium;
+    const diff = BOT_DIFFS[this.difficulty] || BOT_DIFFS.standard;
     const frenzy = p.isBot && this.onlyBotsAlive();
     const bonus = levelBonus(p.level, this.fairMode);
 
@@ -505,9 +504,9 @@ class Room {
         const mA = sA.mass * (a.sizeScale > 1.2 ? 1.6 : 1);
         const mB = sB.mass * (b.sizeScale > 1.2 ? 1.6 : 1);
 
-        const botVuln = this.difficulty === 'easy' ? 1.18 : this.difficulty === 'medium' ? 1.06 : 1.0;
-        const aWins = aD && (!bD || (!a.isBot && b.isBot));
-        const bWins = bD && (!aD || (!b.isBot && a.isBot));
+        const botVuln = this.difficulty === 'standard' ? 1.06 : 1.0;
+        const aWins = aD && (!bD || (this.difficulty === 'standard' && !a.isBot && b.isBot));
+        const bWins = bD && (!aD || (this.difficulty === 'standard' && !b.isBot && a.isBot));
         if (aWins && b.invulnTimer <= 0) {
           const sm = a.superCharged ? 1.85 : 1.0;
           const f = ((a.isBot ? (frenzy ? 19.0 : diff.pushBase) : 12.6 * bA * (b.isBot ? botVuln : 1)) * sm * sA.pushForce) / mB;
@@ -655,7 +654,7 @@ class Room {
   }
 
   botInput(bot, dt) {
-    const diff = BOT_DIFFS[this.difficulty] || BOT_DIFFS.medium;
+    const diff = BOT_DIFFS[this.difficulty] || BOT_DIFFS.standard;
     const frenzy = this.onlyBotsAlive();
     const out = { moveX: 0, moveZ: 0, dashPressed: false, bombPressed: false, taunt: null };
     if (bot.teetering) {
@@ -735,7 +734,7 @@ const httpServer = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'ok', version: '2.8', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
+  res.end(JSON.stringify({ status: 'ok', version: '2.9', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
 });
 
 const wss = new WebSocketServer({ server: httpServer });
