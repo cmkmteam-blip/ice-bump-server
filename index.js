@@ -699,6 +699,11 @@ const httpServer = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url || '/', `http://localhost:${PORT}`);
+  if (url.pathname === '/privacy' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Privacy Policy — Ice Bump: Push Party Online</title><style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.65;color:#1e293b}h1{color:#0c4a6e}h2{color:#0369a1;margin-top:24px}</style></head><body><h1>Privacy Policy — Ice Bump: Push Party Online</h1><p><strong>Last updated:</strong> November 22, 2026</p><p>Ice Bump: Push Party Online respects your privacy. No email or real-name account is required.</p><h2>1. Data Used</h2><ul><li>Chosen nickname, country flag, level, and trophy score for online rooms and leaderboards.</li><li>Local progress (coins, level, unlocked bombs) stored on your device.</li></ul><h2>2. Advertising (Google AdMob)</h2><p>The game uses Google AdMob for menu banners, interstitial ads, and optional rewarded video ads. AdMob may collect device advertising identifiers per <a href="https://policies.google.com/privacy">Google Privacy Policy</a>.</p><h2>3. Contact</h2><p>Uninstall the app or clear app storage to delete local data. Contact: <strong>support@icebump.app</strong></p></body></html>`);
+    return;
+  }
   if (url.pathname === '/leaderboard' && req.method === 'GET') {
     const country = url.searchParams.get('country');
     let entries = [...leaderboardMap.values()];
