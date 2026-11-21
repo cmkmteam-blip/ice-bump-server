@@ -270,6 +270,8 @@ class Room {
     if (arena.shrinks) {
       const progress = 1 - this.roundTimer / ROUND_DURATION;
       this.arenaRadius = Math.max(3.6, arena.baseRadius - progress * (arena.baseRadius - 3.6) * 1.15);
+    } else if (this.onlyBotsAlive()) {
+      this.arenaRadius = Math.max(2.6, this.arenaRadius - 0.85 * dt);
     }
     if (arena.tilts) {
       let comX = 0, comZ = 0, totalW = 0;
@@ -492,16 +494,17 @@ class Room {
         const mA = sA.mass * (a.sizeScale > 1.2 ? 1.6 : 1);
         const mB = sB.mass * (b.sizeScale > 1.2 ? 1.6 : 1);
 
+        const botVuln = this.difficulty === 'easy' ? 1.5 : this.difficulty === 'medium' ? 1.25 : 1.08;
         if (a.dashTimer > 0 && b.dashTimer <= 0 && b.invulnTimer <= 0) {
           const sm = a.superCharged ? 2.0 : 1.0;
-          const f = ((a.isBot ? (frenzy ? 16.5 : diff.pushBase) : 14.5 * bA) * sm * sA.pushForce) / mB;
-          b.vx = nx * f; b.vz = nz * f; b.invulnTimer = 0.5;
+          const f = ((a.isBot ? (frenzy ? 23.0 : diff.pushBase) : 18.2 * bA * (b.isBot ? botVuln : 1)) * sm * sA.pushForce) / mB;
+          b.vx = nx * f; b.vz = nz * f; b.invulnTimer = frenzy ? 0.2 : 0.45;
           if (!a.isBot || frenzy) b.teetering = false;
           a.vx *= 0.35; a.vz *= 0.35; a.dashTimer = 0; a.superCharged = false;
         } else if (b.dashTimer > 0 && a.dashTimer <= 0 && a.invulnTimer <= 0) {
           const sm = b.superCharged ? 2.0 : 1.0;
-          const f = ((b.isBot ? (frenzy ? 16.5 : diff.pushBase) : 14.5 * bB) * sm * sB.pushForce) / mA;
-          a.vx = -nx * f; a.vz = -nz * f; a.invulnTimer = 0.5;
+          const f = ((b.isBot ? (frenzy ? 23.0 : diff.pushBase) : 18.2 * bB * (a.isBot ? botVuln : 1)) * sm * sB.pushForce) / mA;
+          a.vx = -nx * f; a.vz = -nz * f; a.invulnTimer = frenzy ? 0.2 : 0.45;
           if (!b.isBot || frenzy) a.teetering = false;
           b.vx *= 0.35; b.vz *= 0.35; b.dashTimer = 0; b.superCharged = false;
         } else {
@@ -645,7 +648,7 @@ class Room {
       return out;
     }
     const distC = Math.hypot(bot.x, bot.z);
-    if (distC > this.arenaRadius * 0.72) { out.moveX = -bot.x / distC; out.moveZ = -bot.z / distC; return out; }
+    if (!frenzy && distC > this.arenaRadius * 0.72) { out.moveX = -bot.x / distC; out.moveZ = -bot.z / distC; return out; }
     const opps = this.players.filter((p) => p.alive && p.slot !== bot.slot);
     if (!opps.length) return out;
     opps.sort((a, b) => Math.hypot(a.x - bot.x, a.z - bot.z) - Math.hypot(b.x - bot.x, b.z - bot.z));
@@ -653,7 +656,7 @@ class Room {
     const d = Math.max(0.01, Math.hypot(t.x - bot.x, t.z - bot.z));
     out.moveX = (t.x - bot.x) / d; out.moveZ = (t.z - bot.z) / d;
     if (bot.carryingBombId && d < 6 && Math.random() < 0.08) out.bombPressed = true;
-    else if ((frenzy || ROUND_DURATION - this.roundTimer > diff.graceSec) && d < (frenzy ? 3.8 : 2.6) && bot.stamina >= CHAR_SPECS[bot.charId].dashCost && Math.random() < (frenzy ? 0.16 : diff.dashChance)) out.dashPressed = true;
+    else if ((frenzy || ROUND_DURATION - this.roundTimer > diff.graceSec) && d < (frenzy ? 5.8 : 2.6) && bot.stamina >= CHAR_SPECS[bot.charId].dashCost && Math.random() < (frenzy ? 0.65 : diff.dashChance)) out.dashPressed = true;
     return out;
   }
 
