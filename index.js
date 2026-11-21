@@ -41,9 +41,9 @@ const ARENAS = {
 };
 
 const BOT_DIFFS = {
-  easy: { speedMult: 0.45, pushBase: 3.2, regenMult: 0.32, dashChance: 0.002, teeterDelay: 1.9, graceSec: 5.0 },
-  medium: { speedMult: 0.62, pushBase: 5.2, regenMult: 0.48, dashChance: 0.006, teeterDelay: 1.35, graceSec: 3.5 },
-  hard: { speedMult: 0.78, pushBase: 7.5, regenMult: 0.65, dashChance: 0.014, teeterDelay: 0.85, graceSec: 2.0 },
+  easy: { speedMult: 0.62, pushBase: 6.2, regenMult: 0.5, dashChance: 0.005, teeterDelay: 1.25, graceSec: 3.0 },
+  medium: { speedMult: 0.78, pushBase: 8.2, regenMult: 0.68, dashChance: 0.011, teeterDelay: 0.85, graceSec: 2.0 },
+  hard: { speedMult: 0.94, pushBase: 10.2, regenMult: 0.86, dashChance: 0.02, teeterDelay: 0.5, graceSec: 1.0 },
 };
 
 function levelBonus(level, fairMode) {
@@ -439,7 +439,7 @@ class Room {
     }
 
     if (p.knockbackTimer > 0) {
-      const kbDrag = Math.exp(-0.55 * dt);
+      const kbDrag = Math.exp(-1.35 * dt);
       p.vx *= kbDrag; p.vz *= kbDrag;
     } else if (p.dashTimer > 0) {
       p.dashTimer -= dt;
@@ -487,7 +487,7 @@ class Room {
         const b = this.players[j];
         if (!b.alive) continue;
         const aD = a.dashTimer > 0, bD = b.dashTimer > 0;
-        const humanReach = (!a.isBot && aD) || (!b.isBot && bD) ? 1.95 : 0;
+        const humanReach = (!a.isBot && aD) || (!b.isBot && bD) ? 1.55 : 0;
         const minDist = Math.max(0.62 * (a.sizeScale + b.sizeScale), humanReach);
         const dx = b.x - a.x, dz = b.z - a.z;
         const dist = Math.hypot(dx, dz);
@@ -505,25 +505,25 @@ class Room {
         const mA = sA.mass * (a.sizeScale > 1.2 ? 1.6 : 1);
         const mB = sB.mass * (b.sizeScale > 1.2 ? 1.6 : 1);
 
-        const botVuln = this.difficulty === 'easy' ? 1.65 : this.difficulty === 'medium' ? 1.3 : 1.1;
+        const botVuln = this.difficulty === 'easy' ? 1.18 : this.difficulty === 'medium' ? 1.06 : 1.0;
         const aWins = aD && (!bD || (!a.isBot && b.isBot));
         const bWins = bD && (!aD || (!b.isBot && a.isBot));
         if (aWins && b.invulnTimer <= 0) {
-          const sm = a.superCharged ? 2.0 : 1.0;
-          const f = ((a.isBot ? (frenzy ? 24.0 : diff.pushBase) : 16.5 * bA * (b.isBot ? botVuln : 1)) * sm * sA.pushForce) / mB;
+          const sm = a.superCharged ? 1.85 : 1.0;
+          const f = ((a.isBot ? (frenzy ? 19.0 : diff.pushBase) : 12.6 * bA * (b.isBot ? botVuln : 1)) * sm * sA.pushForce) / mB;
           b.vx = nx * f; b.vz = nz * f;
-          b.knockbackTimer = b.isBot ? (this.difficulty === 'easy' ? 0.85 : 0.65) : 0.16;
-          b.invulnTimer = frenzy ? 0.2 : 0.4;
+          b.knockbackTimer = b.isBot ? 0.38 : 0.22;
+          b.invulnTimer = frenzy ? 0.2 : 0.45;
           if (!a.isBot || frenzy) b.teetering = false;
-          a.vx *= 0.25; a.vz *= 0.25; a.dashTimer = 0; a.superCharged = false;
+          a.vx *= 0.3; a.vz *= 0.3; a.dashTimer = 0; a.superCharged = false;
         } else if (bWins && a.invulnTimer <= 0) {
-          const sm = b.superCharged ? 2.0 : 1.0;
-          const f = ((b.isBot ? (frenzy ? 24.0 : diff.pushBase) : 16.5 * bB * (a.isBot ? botVuln : 1)) * sm * sB.pushForce) / mA;
+          const sm = b.superCharged ? 1.85 : 1.0;
+          const f = ((b.isBot ? (frenzy ? 19.0 : diff.pushBase) : 12.6 * bB * (a.isBot ? botVuln : 1)) * sm * sB.pushForce) / mA;
           a.vx = -nx * f; a.vz = -nz * f;
-          a.knockbackTimer = a.isBot ? (this.difficulty === 'easy' ? 0.85 : 0.65) : 0.16;
-          a.invulnTimer = frenzy ? 0.2 : 0.4;
+          a.knockbackTimer = a.isBot ? 0.38 : 0.22;
+          a.invulnTimer = frenzy ? 0.2 : 0.45;
           if (!b.isBot || frenzy) a.teetering = false;
-          b.vx *= 0.25; b.vz *= 0.25; b.dashTimer = 0; b.superCharged = false;
+          b.vx *= 0.3; b.vz *= 0.3; b.dashTimer = 0; b.superCharged = false;
         } else {
           const sep = (b.vx - a.vx) * nx + (b.vz - a.vz) * nz;
           if (sep < 0) {
@@ -735,7 +735,7 @@ const httpServer = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'ok', version: '2.7', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
+  res.end(JSON.stringify({ status: 'ok', version: '2.8', game: 'Ice Bump: Push Party Online', activeRooms: rooms.size }));
 });
 
 const wss = new WebSocketServer({ server: httpServer });
